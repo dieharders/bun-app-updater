@@ -160,9 +160,12 @@ Without a workspace, the same thing works with a path dependency
      endTheEventLoop();
    });
    // … webview.run() returns, shut down the server …
-   if (restartRequested) updater.relaunch();
+   if (restartRequested) await updater.relaunch();
    process.exit(0);
    ```
+
+   Await it: on macOS `relaunch` goes through `open -n`, and if that fails it starts the
+   executable directly, which only a process still alive to see `open` fail can do.
 
    With webview-bun, ending the loop from a bound callback is `lib.symbols.webview_terminate(webview.unsafeHandle)`
    (`import { lib } from 'webview-bun/src/ffi'`); the class's `destroy()` would free the handle

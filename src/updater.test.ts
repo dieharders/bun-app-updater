@@ -6,7 +6,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { MANIFEST_FORMAT } from './manifest'
-import { type Release, type ReleaseAsset, type ReleaseSource, staticRelease } from './source'
+import { type Release, type ReleaseAsset, ReleaseFeedError, type ReleaseSource, staticRelease } from './source'
 import { hashTree } from './tree-hash'
 import { type InstallEvent, type UpdaterConfig, createUpdater } from './updater'
 
@@ -16,14 +16,18 @@ const sha = (b: Uint8Array | string) => createHash('sha256').update(b).digest('h
 
 /** What a release serves: the manifest and one zip per part, by asset name. */
 const served = new Map<string, Uint8Array>()
+/** An asset held back until its promise settles, to catch the updater mid-step. */
+const held = new Map<string, Promise<void>>()
 let server: ReturnType<typeof Bun.serve>
 let base = ''
 beforeAll(() => {
   server = Bun.serve({
     hostname: '127.0.0.1',
     port: 0,
-    fetch: (req) => {
-      const body = served.get(new URL(req.url).pathname.slice(1))
+    fetch: async (req) => {
+      const name = new URL(req.url).pathname.slice(1)
+      await held.get(name)
+      const body = served.get(name)
       return body ? new Response(new Uint8Array(body)) : new Response('nope', { status: 404 })
     },
   })
@@ -100,6 +104,8 @@ const make = (over: Partial<UpdaterConfig> = {}, install: Partial<typeof BUILD> 
     execPath: path.join(dir, 'app').replace(/\\/g, '/'),
     downloadDir: dir,
     apply: async () => {},
+    // Quiet: without a log, failures go to console.warn, and these tests fail installs on purpose.
+    log: () => {},
     ...over,
   })
 }
@@ -141,15 +147,48 @@ describe('check', () => {
     await u.check({ force: true })
     expect(calls).toBe(1) // inside the 60s floor
   })
-  test('a failed background check offers nothing; a failed forced check says why', async () => {
-    const source: ReleaseSource = {
+  test('a failed background check offers nothing; a failed forced check says why, in the feed\'s words only', async () => {
+    const logged: string[] = []
+    const raw: ReleaseSource = {
       latest: async () => {
-        throw new Error('no network')
+        throw new Error('ECONNRESET 140.82.112.6:443')
+      },
+    }
+    const u = make({ source: raw, log: (line) => logged.push(line) })
+    expect((await u.check()).latest).toBeNull()
+    // A raw error is not shown; it is logged.
+    const err = await u.check({ force: true }).catch((e) => e)
+    expect(err).toBeInstanceOf(ReleaseFeedError)
+    expect(err.message).toBe('The release feed could not be reached. Check your connection and try again.')
+    expect(logged.some((l) => l.includes('ECONNRESET'))).toBe(true)
+    // A ReleaseFeedError is written to be shown, and is.
+    const feed: ReleaseSource = {
+      latest: async () => {
+        throw new ReleaseFeedError('GitHub is turning away update requests for now. Try again in an hour.', 'rate_limited')
+      },
+    }
+    await expect(make({ source: feed }).check({ force: true })).rejects.toThrow(/turning away/)
+  })
+  test('a page that drops its check neither caches a failure nor fails anyone else', async () => {
+    let calls = 0
+    const source: ReleaseSource = {
+      latest: async (signal) => {
+        calls++
+        await Bun.sleep(30)
+        if (signal?.aborted) throw new DOMException('aborted', 'AbortError')
+        return release('1.1.0')
       },
     }
     const u = make({ source })
-    expect((await u.check()).latest).toBeNull()
-    await expect(u.check({ force: true })).rejects.toThrow(/no network/)
+    const dropped = new AbortController()
+    const first = u.check({ signal: dropped.signal })
+    const second = u.check()
+    dropped.abort()
+    expect((await first.catch((e) => e)).code).toBe('cancelled')
+    expect((await second).latest?.version).toBe('1.1.0')
+    // And the answer is the one cached: the next page sees the update too, without asking again.
+    expect((await u.check()).latest?.version).toBe('1.1.0')
+    expect(calls).toBe(1)
   })
 })
 
@@ -232,6 +271,73 @@ describe('install', () => {
     expect(err.message).toBe('The update failed. Try again, or download the update instead.')
     expect(events.at(-1)).toEqual({ type: 'done', ok: false, code: 'swap_failed', message: err.message })
     expect(logged.at(-1)).toContain(raw)
+  })
+  test('with no log, the raw failure still goes somewhere: console.warn', async () => {
+    const warned: string[] = []
+    const warn = console.warn
+    console.warn = (line: string) => void warned.push(line)
+    try {
+      const u = make({
+        log: undefined,
+        apply: async () => {
+          throw new Error('ENOSPC: no space left on device, write')
+        },
+      })
+      await u.install({ onEvent: () => {} }).catch(() => {})
+    } finally {
+      console.warn = warn
+    }
+    expect(warned.some((l) => l.startsWith('[App updater] install failed (swap_failed)') && l.includes('ENOSPC'))).toBe(true)
+  })
+  test('once the new files are in place, the install is done, whatever a hook or a cleanup says', async () => {
+    const logged: string[] = []
+    // A hook that throws, and a staged zip that can't be removed (a scanner holding it, say).
+    const u = make({
+      log: (line) => logged.push(line),
+      apply: async (zips) => {
+        fs.rmSync(zips[0]!)
+        fs.mkdirSync(zips[0]!)
+        fs.writeFileSync(path.join(zips[0]!, 'held'), '')
+      },
+      hooks: {
+        afterSwap: () => {
+          throw new Error('reg.exe exited 1')
+        },
+      },
+    })
+    const { events, onEvent } = collect()
+    expect(await u.install({ onEvent })).toEqual({ version: '1.1.0' })
+    expect(events.at(-1)).toEqual({ type: 'done', ok: true, version: '1.1.0' })
+    expect(u.installedVersion()).toBe('1.1.0')
+    expect(logged.some((l) => l.includes('afterSwap hook failed') && l.includes('reg.exe'))).toBe(true)
+    expect(logged.some((l) => l.startsWith('could not remove'))).toBe(true)
+  })
+  test('the install\'s signal reaches the swap, which is what stops a cancelled unpack', async () => {
+    let seen: AbortSignal | undefined
+    const u = make({ apply: async (_z, _p, _t, _e, signal) => void (seen = signal) })
+    const ac = new AbortController()
+    await u.install({ onEvent: () => {}, signal: ac.signal })
+    expect(seen).toBe(ac.signal)
+  })
+  test('an install waiting on the plan a dropped check started is not cancelled with it', async () => {
+    const u = make()
+    let open = () => {}
+    held.set('App-1.1.0-linux-x64.manifest.json', new Promise<void>((r) => (open = r)))
+    try {
+      const dropped = new AbortController()
+      const checking = u.check({ signal: dropped.signal })
+      await Bun.sleep(30) // the check's plan is now waiting on the manifest
+      const { events, onEvent } = collect()
+      const installing = u.install({ onEvent })
+      await Bun.sleep(30) // and so is the install, on the same plan
+      dropped.abort()
+      open()
+      expect((await checking).latest?.size).toBe(0) // the check stopped waiting
+      expect(await installing).toEqual({ version: '1.1.0' })
+      expect(events.at(-1)).toEqual({ type: 'done', ok: true, version: '1.1.0' })
+    } finally {
+      held.clear()
+    }
   })
   test('a second install while one runs is refused, and the done event carries failures', async () => {
     let release_: (() => void) | null = null

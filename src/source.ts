@@ -7,6 +7,7 @@
  * interface is what lets the same updater read GitHub Releases in production and a JSON file on
  * a loopback server in a test, with no branch in the install path.
  */
+import { isAbort } from './errors'
 import { compareVersions, parseVersion } from './version'
 
 export interface ReleaseAsset {
@@ -28,8 +29,9 @@ export interface Release {
 
 export interface ReleaseSource {
   /**
-   * The newest published release, or null when there is none. Throws, with a message fit to
-   * show, when the feed cannot be read (offline, rate-limited, a broken manifest).
+   * The newest published release, or null when there is none. Throws a `ReleaseFeedError`, with
+   * a message fit to show, when the feed cannot be read (offline, rate-limited, a broken
+   * manifest). Anything else it throws is shown as "could not be reached", its text only logged.
    */
   latest(signal?: AbortSignal): Promise<Release | null>
 }
@@ -100,7 +102,16 @@ export function githubReleases(opts: GithubReleasesOptions): ReleaseSource {
       }
       if (!res.ok) throw new ReleaseFeedError(`GitHub did not answer about updates (${res.status}). Try again later.`, 'bad_feed')
 
-      const list = (await res.json()) as GithubRelease[]
+      // The body is read under the same signal and timeout as the request, and fails the same
+      // ways: a timeout half way is the network; a page that isn't JSON (a captive portal's) is the feed.
+      let list: GithubRelease[]
+      try {
+        list = (await res.json()) as GithubRelease[]
+      } catch (err) {
+        if (signal?.aborted) throw err
+        if (isAbort(err)) throw new ReleaseFeedError('The release feed could not be reached. Check your connection and try again.', 'offline')
+        throw new ReleaseFeedError('The release feed is not valid JSON.', 'bad_feed')
+      }
       if (!Array.isArray(list)) throw new ReleaseFeedError('The release feed is not in the expected shape.', 'bad_feed')
 
       let best: Release | null = null

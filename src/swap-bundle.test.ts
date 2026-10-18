@@ -72,4 +72,45 @@ describe.skipIf(!darwin)('applyBundleUpdate', () => {
     expect(fs.readFileSync(path.join(oldApp, 'Contents/MacOS/tiny'), 'utf8')).toContain('echo old')
     expect(fs.readdirSync(path.dirname(oldApp))).toEqual(['Tiny.app'])
   })
+
+  const newZip = async (name: string) => {
+    const zip = path.join(tmp, `${name}.zip`)
+    await run(['ditto', '-c', '-k', '--norsrc', '--noextattr', '--keepParent', await makeApp(fs.mkdtempSync(path.join(tmp, `${name}-`)), 'new'), zip])
+    return zip
+  }
+  const targetOf = (app: string) => ({ layout: 'bundle' as const, path: app, executable: path.join(app, 'Contents/MacOS/tiny') })
+
+  test('a swap that cannot put the app back leaves it at .old, and the next swap puts it back before anything else', async () => {
+    const oldApp = await makeApp(fs.mkdtempSync(path.join(tmp, 'installed3-')), 'old')
+    const zip = await newZip('build3')
+    // The new bundle will not move in, and the old one will not move back.
+    const rename = (from: string, to: string) => {
+      if (to === oldApp) throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
+      fs.renameSync(from, to)
+    }
+    const err = await applyBundleUpdate(zip, targetOf(oldApp), { appName: 'Tiny', bundleExecutable: 'tiny', rename }).catch((e) => e)
+    expect(err.code).toBe('swap_failed')
+    expect(err.message).toBe("Tiny couldn't swap the update in or put itself back. In the folder Tiny was in, rename Tiny.app.old to Tiny.app.")
+    expect(fs.readdirSync(path.dirname(oldApp))).toEqual(['Tiny.app.old'])
+
+    await applyBundleUpdate(zip, targetOf(oldApp), { appName: 'Tiny', bundleExecutable: 'tiny' })
+    expect(fs.readFileSync(path.join(oldApp, 'Contents/MacOS/tiny'), 'utf8')).toContain('echo new')
+    expect(fs.readdirSync(path.dirname(oldApp))).toEqual(['Tiny.app'])
+  })
+
+  test.skipIf(process.getuid?.() === 0)('an old bundle that will not be removed does not fail a swap that worked', async () => {
+    const oldApp = await makeApp(fs.mkdtempSync(path.join(tmp, 'installed4-')), 'old')
+    // A vendored toolchain's read-only folder: rm can't empty it.
+    const locked = path.join(oldApp, 'Contents', 'Resources', 'locked')
+    fs.mkdirSync(locked)
+    fs.writeFileSync(path.join(locked, 'tool'), 'x')
+    fs.chmodSync(locked, 0o555)
+    try {
+      await applyBundleUpdate(await newZip('build4'), targetOf(oldApp), { appName: 'Tiny', bundleExecutable: 'tiny', verifySignature: false })
+      expect(fs.readFileSync(path.join(oldApp, 'Contents/MacOS/tiny'), 'utf8')).toContain('echo new')
+      expect(fs.existsSync(`${oldApp}.old`)).toBe(true) // left for the next launch's cleanup
+    } finally {
+      fs.chmodSync(path.join(`${oldApp}.old`, 'Contents', 'Resources', 'locked'), 0o755)
+    }
+  })
 })

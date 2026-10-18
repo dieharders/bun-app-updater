@@ -21,12 +21,25 @@ export interface BundleSwapOptions {
   bundleExecutable: string
   /** Set false only in tests of unsigned bundles. */
   verifySignature?: boolean
+  /** Injectable for the rollback test; defaults to fs.renameSync. */
+  rename?: (from: string, to: string) => void
 }
 
 export async function applyBundleUpdate(zipPath: string, target: InstallTarget, opts: BundleSwapOptions): Promise<void> {
   const app = target.path
   const fresh = `${app}.new`
   const old = `${app}.old`
+  const rename = opts.rename ?? fs.renameSync
+
+  // An earlier swap that could not put the app back left it only at `.old`. That is the user's
+  // one copy, and the swap below starts by removing `.old`, so it goes back first.
+  if (!fs.existsSync(app) && fs.existsSync(old)) {
+    try {
+      rename(old, app)
+    } catch (err) {
+      throw new UpdateError('swap_failed', putBackMessage(opts.appName, app, old), { cause: err })
+    }
+  }
 
   fs.rmSync(fresh, { recursive: true, force: true })
   let incoming: string
@@ -65,20 +78,37 @@ export async function applyBundleUpdate(zipPath: string, target: InstallTarget, 
 
   try {
     fs.rmSync(old, { recursive: true, force: true })
-    fs.renameSync(app, old)
+    rename(app, old)
   } catch (err) {
     fs.rmSync(fresh, { recursive: true, force: true })
     throw new UpdateError('swap_failed', `${opts.appName} can't replace itself where it's installed. Download the update instead.`, { cause: err })
   }
   try {
-    fs.renameSync(incoming, app)
+    rename(incoming, app)
   } catch (err) {
-    fs.renameSync(old, app)
-    fs.rmSync(fresh, { recursive: true, force: true })
+    removeQuietly(fresh)
+    try {
+      rename(old, app)
+    } catch {
+      // The app is now only at `.old`, which stays: the next launch or install puts it back.
+      throw new UpdateError('swap_failed', putBackMessage(opts.appName, app, old), { cause: err })
+    }
     throw new UpdateError('swap_failed', `${opts.appName} couldn't swap the update in.`, { cause: err })
   }
-  fs.rmSync(fresh, { recursive: true, force: true })
-  fs.rmSync(old, { recursive: true, force: true })
+  // The update is in place: what is left is cleanup, and cleanUpAfterUpdate retries it.
+  removeQuietly(fresh)
+  removeQuietly(old)
+}
+
+const putBackMessage = (appName: string, app: string, old: string): string =>
+  `${appName} couldn't swap the update in or put itself back. In the folder ${appName} was in, rename ${path.basename(old)} to ${path.basename(app)}.`
+
+const removeQuietly = (p: string): void => {
+  try {
+    fs.rmSync(p, { recursive: true, force: true })
+  } catch {
+    // Still held; cleanUpAfterUpdate tries again at the next launch.
+  }
 }
 
 /**

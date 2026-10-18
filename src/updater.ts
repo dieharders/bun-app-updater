@@ -21,7 +21,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { downloadTo } from './download'
-import { type InstallErrorCode, UpdateError, isAbort } from './errors'
+import { type InstallErrorCode, UpdateError } from './errors'
 import { type UpdateManifest, type UpdatePart, parseManifest } from './manifest'
 import { cleanUpAfterUpdate, relaunch as relaunchTarget } from './relaunch'
 import { ReleaseFeedError, type Release, type ReleaseAsset, type ReleaseSource } from './source'
@@ -51,12 +51,17 @@ export interface UpdaterConfig {
   /** Where the download is staged. Default: the OS temp directory. */
   downloadDir?: string
   hooks?: {
-    /** After the new files are in place and before the install is reported done. */
+    /**
+     * After the new files are in place and before the install is reported done. A hook that
+     * throws is logged, and the install is still reported done: the new version is in place
+     * either way, and only a restart moves on from there.
+     */
     afterSwap?: (ctx: { version: string; target: InstallTarget }) => Promise<void> | void
   }
+  /** Where the updater's diagnostics go. Without it, only failures are written, with `console.warn`. */
   log?: (line: string) => void
   /** Test seam: replaces the real swap. One zip per part, in the manifest's order. */
-  apply?: (zipPaths: string[], parts: UpdatePart[], target: InstallTarget, events: InstallEventSink) => Promise<void>
+  apply?: (zipPaths: string[], parts: UpdatePart[], target: InstallTarget, events: InstallEventSink, signal?: AbortSignal) => Promise<void>
 }
 
 /** What `check()` answers. */
@@ -95,8 +100,12 @@ export interface Updater {
   /** Whether an install is between download and swap right now. */
   installing(): boolean
   target(): InstallTarget | null
-  /** Start the copy now at the install path; call as the app quits. */
-  relaunch(): void
+  /**
+   * Start the copy now at the install path; call as the app quits, and await it before exiting:
+   * on macOS the fallback for a failed `open` only runs in a process still alive to see it fail.
+   * Always a promise here; `void` is allowed so an app's test fake can stay `() => {}`.
+   */
+  relaunch(): Promise<void> | void
   /** Remove a previous update's leftovers; call at launch. */
   cleanUp(): void
   /** The release the last check found, newer or not. */
@@ -124,6 +133,9 @@ export function createUpdater(config: UpdaterConfig): Updater {
   const targetId = targetName(platform, arch)
   const ttl = config.checkTtlMs ?? DEFAULT_TTL
   const log = config.log ?? (() => {})
+  // Failures are written somewhere even when the app gives no `log`: what the user is shown is
+  // deliberately plain (no paths, no errnos), so this line is the only record of what happened.
+  const warn = config.log ?? ((line: string) => console.warn(`[${config.appName} updater] ${line}`))
   const downloadDir = () => config.downloadDir ?? os.tmpdir()
   const stagePath = (suffix: string) => path.join(downloadDir(), `${config.appName.toLowerCase()}-update-${process.pid}-${suffix}`)
 
@@ -140,19 +152,25 @@ export function createUpdater(config: UpdaterConfig): Updater {
   }
   const isNewer = (release: Release | null): release is Release => !!release && compareVersions(release.version, config.version) > 0
 
-  /** Fetch and verify the manifest, hash the install, decide what to download. */
-  const makePlan = async (release: Release, signal?: AbortSignal): Promise<Plan> => {
+  /**
+   * Fetch and verify the manifest, hash the install, decide what to download. Takes no signal:
+   * the plan is shared by every caller that asks about this version (see `planFor`).
+   */
+  const makePlan = async (release: Release): Promise<Plan> => {
     const asset = manifestAssetFor(release)!
     const file = stagePath(`${release.version}.manifest.json`)
+    let text: string
+    try {
+      await downloadTo(asset.url, file, { size: asset.size, sha256: asset.sha256 ?? '' })
+      text = fs.readFileSync(file, 'utf8')
+    } finally {
+      removeQuietly(file)
+    }
     let raw: unknown
     try {
-      await downloadTo(asset.url, file, { size: asset.size, sha256: asset.sha256 ?? '', signal })
-      raw = JSON.parse(fs.readFileSync(file, 'utf8'))
+      raw = JSON.parse(text)
     } catch (err) {
-      if (err instanceof UpdateError) throw err
       throw new UpdateError('damaged', "The release's update manifest isn't valid JSON.", { cause: err })
-    } finally {
-      fs.rmSync(file, { force: true })
     }
     const manifest = parseManifest(raw, { version: release.version, target: targetId })
     const urls = new Map<string, string>()
@@ -174,7 +192,7 @@ export function createUpdater(config: UpdaterConfig): Updater {
       }
       needed = []
       for (const part of manifest.parts) {
-        const here = await hashTree(path.join(target.path, part.name), { signal })
+        const here = await hashTree(path.join(target.path, part.name))
         if (here !== part.tree) needed.push(part)
       }
     }
@@ -183,9 +201,15 @@ export function createUpdater(config: UpdaterConfig): Updater {
     return { manifest, needed, urls, bytes }
   }
 
+  /**
+   * The plan for `release`, made once and shared: a check and an install asking at the same
+   * time wait on the same work. So it runs under no caller's signal — a page dropping its check
+   * must not fail the install waiting beside it. A caller whose signal fires stops waiting; the
+   * plan carries on for the others, and for the next ask.
+   */
   const planFor = (release: Release, signal?: AbortSignal): Promise<Plan> => {
     if (plans?.version !== release.version) {
-      const plan = makePlan(release, signal)
+      const plan = makePlan(release)
       const entry = { version: release.version, plan }
       plans = entry
       // A failed plan is not kept: the next ask tries again (the feed may have been fixed).
@@ -193,7 +217,7 @@ export function createUpdater(config: UpdaterConfig): Updater {
         if (plans === entry) plans = null
       })
     }
-    return plans.plan
+    return untilAborted(plans.plan, signal)
   }
 
   const describe = async (release: Release | null, blocked: string | null, signal?: AbortSignal): Promise<UpdateInfo> => {
@@ -208,8 +232,9 @@ export function createUpdater(config: UpdaterConfig): Updater {
         latest.parts = plan.needed.map((p) => p.name)
         need = plan.bytes * 3
       } catch (err) {
-        // Still offered: the install says what is wrong with it, in words.
-        log(`could not plan ${release.version}: ${(err as Error).message}`)
+        // Still offered: the install says what is wrong with it, in words. (A caller that went
+        // away is not a failure; the plan carries on without it.)
+        if (!signal?.aborted) warn(`could not plan ${release.version}: ${errorText(err)}`)
       }
     }
     return {
@@ -236,13 +261,27 @@ export function createUpdater(config: UpdaterConfig): Updater {
     if (!lastCheck || stale) {
       // Offline, or the feed is down: no update to offer, and nothing worth telling the user
       // from a background check. A forced check surfaces the reason.
-      const release = fetchRelease(opts.signal)
+      //
+      // The answer is cached for every page that asks, so the fetch runs under none of their
+      // signals: one page reloading mid-check would otherwise cache "no update" for the TTL.
+      const release = fetchRelease()
       const entry = { at: Date.now(), release: release.catch(() => null), failed: false }
-      release.catch(() => (entry.failed = true))
+      release.catch((err) => {
+        entry.failed = true
+        warn(`check failed: ${errorText(err)}`)
+      })
       lastCheck = entry
-      if (opts.force) await release
+      if (opts.force) {
+        try {
+          await untilAborted(release, opts.signal)
+        } catch (err) {
+          // The feed's own errors are written to be shown; anything else is raw, and only logged.
+          if (err instanceof ReleaseFeedError || err instanceof UpdateError) throw err
+          throw new ReleaseFeedError(UNREACHABLE, 'offline')
+        }
+      }
     }
-    const release = await lastCheck.release
+    const release = await untilAborted(lastCheck.release, opts.signal)
     return describe(release, null, opts.signal)
   }
 
@@ -268,9 +307,10 @@ export function createUpdater(config: UpdaterConfig): Updater {
         release = await fetchRelease(signal)
         lastCheck = { at: Date.now(), release: Promise.resolve(release), failed: false }
       } catch (err) {
-        if (signal?.aborted || isAbort(err)) fail('cancelled', 'The update was cancelled.', err)
+        // Only this install's own signal is a cancel. A feed's timeout is the network.
+        if (signal?.aborted) fail('cancelled', 'The update was cancelled.', err)
         const feed = err instanceof ReleaseFeedError ? err : null
-        fail('offline', feed?.message ?? 'The release feed could not be reached. Check your connection and try again.', err)
+        fail('offline', feed?.message ?? UNREACHABLE, err)
       }
       if (!isNewer(release) || !manifestAssetFor(release)) fail('no_update', "There's no newer version to install.")
       const plan = await planFor(release!, signal)
@@ -302,38 +342,45 @@ export function createUpdater(config: UpdaterConfig): Updater {
 
       onEvent({ type: 'unpacking', done: 0, total: 1 })
       const apply = config.apply ?? defaultApply
-      await apply(zipPaths, plan.needed, target!, onEvent)
+      await apply(zipPaths, plan.needed, target!, onEvent, signal)
+      // The new files are in place. From here the answer is "restart to finish", whatever else
+      // happens: nothing below may report the install as failed.
       plans = null
-      await config.hooks?.afterSwap?.({ version: release!.version, target: target! })
       installed = release!.version
+      try {
+        await config.hooks?.afterSwap?.({ version: installed, target: target! })
+      } catch (err) {
+        warn(`afterSwap hook failed after ${installed} was swapped in: ${errorText(err)}`)
+      }
       log(`installed ${installed}; restart to finish`)
       onEvent({ type: 'done', ok: true, version: installed })
       return { version: installed }
     } catch (err) {
-      // Anything not already an UpdateError is unexpected (an fs error, a hook that threw) and its
-      // message is raw: paths inside the install, errno codes. The user gets a sentence; the
-      // original goes in `cause`, which the log line below prints.
+      // Anything not already an UpdateError is unexpected (an fs error, a custom `apply` that
+      // threw) and its message is raw: paths inside the install, errno codes. The user gets a
+      // sentence; the original goes in `cause`, which the log line below prints.
       const update =
         err instanceof UpdateError
           ? err
           : signal?.aborted
             ? new UpdateError('cancelled', 'The update was cancelled.', { cause: err })
             : new UpdateError('swap_failed', 'The update failed. Try again, or download the update instead.', { cause: err })
-      log(`install failed (${update.code}): ${update.message}${update.cause ? ` — ${String((update.cause as Error).message ?? update.cause)}` : ''}`)
+      warn(`install failed (${update.code}): ${update.message}${update.cause ? ` — ${errorText(update.cause)}` : ''}`)
       onEvent({ type: 'done', ok: false, code: update.code, message: update.message })
       throw update
     } finally {
       if (owned) installing = false
-      for (const zipPath of zipPaths) fs.rmSync(zipPath, { force: true })
+      for (const zipPath of zipPaths) removeQuietly(zipPath)
     }
   }
 
-  const defaultApply: NonNullable<UpdaterConfig['apply']> = async (zips, parts, tgt, onEvent) => {
+  const defaultApply: NonNullable<UpdaterConfig['apply']> = async (zips, parts, tgt, onEvent, signal) => {
     if (tgt.layout === 'bundle') {
       if (zips.length !== 1) throw new UpdateError('damaged', `The release lists ${zips.length} parts for a ${config.appName} bundle; it must be one.`)
       await applyBundleUpdate(zips[0]!, tgt, {
         appName: config.appName,
         bundleExecutable: config.bundleExecutable ?? path.basename(tgt.executable),
+        signal,
         onSwapping: () => onEvent({ type: 'swapping' }),
       })
     } else {
@@ -341,9 +388,19 @@ export function createUpdater(config: UpdaterConfig): Updater {
         appName: config.appName,
         platform,
         expect: parts.map((p) => p.name),
+        signal,
         onUnpackProgress: (done, total) => onEvent({ type: 'unpacking', done, total }),
         onSwapping: () => onEvent({ type: 'swapping' }),
       })
+    }
+  }
+
+  /** For staged downloads: a file a scanner still holds must not replace the install's own outcome. */
+  const removeQuietly = (file: string): void => {
+    try {
+      fs.rmSync(file, { force: true })
+    } catch (err) {
+      warn(`could not remove ${file}: ${errorText(err)}`)
     }
   }
 
@@ -353,10 +410,36 @@ export function createUpdater(config: UpdaterConfig): Updater {
     installedVersion: () => installed,
     installing: () => installing,
     target: () => target,
-    relaunch: () => {
-      if (target) relaunchTarget(target, { platform, log })
-    },
+    relaunch: () => (target ? relaunchTarget(target, { platform, log: warn }) : Promise.resolve()),
     cleanUp: () => cleanUpAfterUpdate(target),
     lastRelease: () => lastRelease,
   }
+}
+
+const UNREACHABLE = 'The release feed could not be reached. Check your connection and try again.'
+
+const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err))
+
+/**
+ * `promise`, or a `cancelled` rejection as soon as `signal` fires, whichever comes first. The
+ * work behind `promise` is not stopped: others may be waiting on it.
+ */
+function untilAborted<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise
+  const cancelled = () => new UpdateError('cancelled', 'The update was cancelled.')
+  if (signal.aborted) return Promise.reject(cancelled())
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(cancelled())
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(value)
+      },
+      (err) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(err)
+      },
+    )
+  })
 }

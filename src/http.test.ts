@@ -19,6 +19,7 @@ const make = () => {
     arch: 'x64',
     execPath: path.join(dir, 'app'),
     downloadDir: dir,
+    log: () => {},
   })
   return { http: updateHttp(updater), checks: () => checks }
 }

@@ -63,6 +63,26 @@ describe('githubReleases', () => {
     expect(err).toBeInstanceOf(ReleaseFeedError)
     expect(err.code).toBe('offline')
   })
+
+  test('a body that is not JSON (a captive portal) or that times out half way is a feed error, not a raw one', async () => {
+    const portal: Fetch = async () => new Response('<html>Sign in to the hotel Wi-Fi</html>', { status: 200 })
+    const bad = await githubReleases({ repo: 'o/r', tagPrefix: 'v', userAgent: 'T', fetch: portal }).latest().catch((e) => e)
+    expect(bad).toBeInstanceOf(ReleaseFeedError)
+    expect(bad.code).toBe('bad_feed')
+    // Headers arrive, then the body stalls past the timeout.
+    const stalls: Fetch = async (_url, init) =>
+      new Response(
+        new ReadableStream({
+          start(c) {
+            c.enqueue(new TextEncoder().encode('['))
+            init?.signal?.addEventListener('abort', () => c.error(init.signal!.reason))
+          },
+        }),
+      )
+    const slow = await githubReleases({ repo: 'o/r', tagPrefix: 'v', userAgent: 'T', fetch: stalls, timeoutMs: 50 }).latest().catch((e) => e)
+    expect(slow).toBeInstanceOf(ReleaseFeedError)
+    expect(slow.code).toBe('offline')
+  })
 })
 
 describe('jsonRelease', () => {

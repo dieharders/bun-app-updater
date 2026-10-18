@@ -62,7 +62,11 @@ export interface WrittenParts {
 
 export async function writeUpdateParts(opts: WritePartsOptions): Promise<WrittenParts> {
   const log = opts.log ?? (() => {})
-  const { sourceDir, outDir, platform } = opts
+  const { platform } = opts
+  // Absolute, because the Linux archiver runs in `sourceDir`: a relative `outDir` would be read
+  // from there rather than from where the build runs.
+  const sourceDir = path.resolve(opts.sourceDir)
+  const outDir = path.resolve(opts.outDir)
   fs.rmSync(outDir, { recursive: true, force: true })
   fs.mkdirSync(outDir, { recursive: true })
 

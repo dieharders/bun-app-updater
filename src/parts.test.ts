@@ -64,3 +64,25 @@ describe.skipIf(platform === 'darwin')('writeUpdateParts', () => {
     expect(fs.readdirSync(out)).toEqual([])
   })
 })
+
+// Info-ZIP runs in `sourceDir`; it is on macOS too, so the Linux path is tested there as well.
+describe.skipIf(platform === 'win32' || !Bun.which('zip'))('writeUpdateParts, Linux', () => {
+  test('a relative outDir is read from where the build runs, not from sourceDir', async () => {
+    const dir = stage()
+    const out = path.relative(process.cwd(), path.join(tmp, 'rel-out'))
+    expect(path.isAbsolute(out)).toBe(false)
+    const written = await writeUpdateParts({
+      sourceDir: path.relative(process.cwd(), dir),
+      outDir: out,
+      version: '1.0.0',
+      target: 'linux-x64',
+      platform: 'linux',
+      manifestName: 'm.json',
+      partName: (entry) => `${entry}.zip`,
+      skip: ['app.desktop'],
+      executables: ['vendor/ffmpeg'],
+    })
+    expect(fs.readdirSync(path.join(tmp, 'rel-out')).sort()).toEqual(['app.zip', 'm.json', 'vendor.zip'])
+    expect(written.files.every((f) => path.isAbsolute(f))).toBe(true)
+  })
+})

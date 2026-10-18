@@ -112,4 +112,58 @@ describe('applyDirectoryUpdate', () => {
     expect(tree(t.path)).toEqual(before)
     expect(fs.existsSync(path.join(t.path, NEW_DIR))).toBe(false)
   })
+
+  /** Refuses, every time, the moves `refuse` picks out: a lock that outlasts the retries. */
+  const refusing = (refuse: (from: string, to: string) => boolean) => (from: string, to: string) => {
+    if (refuse(from, to)) {
+      const err = new Error('EPERM: operation not permitted') as NodeJS.ErrnoException
+      err.code = 'EPERM'
+      err.path = from
+      throw err
+    }
+    fs.renameSync(from, to)
+  }
+  const inside = (p: string, dir: string) => p.split(path.sep).includes(dir)
+
+  test('an original the rollback cannot put back is kept, and the next launch puts it back', async () => {
+    const t = install('app')
+    const before = tree(t.path)
+    // The new library will not move in, and the old vendor will not move back out of .update-old.
+    const rename = refusing((from, to) => (path.basename(to) === 'library' && inside(from, NEW_DIR)) || (path.basename(from) === 'vendor' && inside(from, OLD_DIR)))
+    const err = await applyDirectoryUpdate(build('app'), t, { appName: 'App', platform: 'linux', rename, retryDelaysMs: [1] }).catch((e) => e)
+    expect(err.code).toBe('swap_failed')
+    expect(err.message).toMatch(/put all of its own files back/)
+    // The user's vendor is not gone: it waits in .update-old, which is not removed.
+    expect(fs.readFileSync(path.join(t.path, OLD_DIR, 'vendor', 'only-old.txt'), 'utf8')).toBe('gone after update')
+    expect(fs.readFileSync(t.executable, 'utf8')).toBe('old exe')
+    cleanUpAfterUpdate(t)
+    expect(tree(t.path)).toEqual(before)
+    expect(fs.existsSync(path.join(t.path, OLD_DIR))).toBe(false)
+  })
+
+  test('where the update\'s copy could not be moved back out, the next install puts the original back before anything else', async () => {
+    const t = install('app')
+    // The new library will not move in, and the new vendor will not move back out of place.
+    const rename = refusing((from, to) => (path.basename(to) === 'library' && inside(from, NEW_DIR)) || (path.basename(from) === 'vendor' && inside(to, NEW_DIR)))
+    const err = await applyDirectoryUpdate(build('app'), t, { appName: 'App', platform: 'linux', rename, retryDelaysMs: [1] }).catch((e) => e)
+    expect(err.code).toBe('swap_failed')
+    expect(fs.readFileSync(path.join(t.path, 'vendor', 'ffmpeg'), 'utf8')).toBe('new ffmpeg') // stuck in place
+    expect(fs.readFileSync(path.join(t.path, OLD_DIR, 'vendor', 'ffmpeg'), 'utf8')).toBe('old ffmpeg')
+    // The next install starts by removing .update-old; the original vendor goes back first, then the swap runs.
+    const [exe] = build('app')
+    await applyDirectoryUpdate([exe!], t, { appName: 'App', platform: 'linux', expect: ['app'] })
+    expect(tree(t.path)).toEqual({ app: 'new exe', 'vendor/ffmpeg': 'old ffmpeg', 'vendor/only-old.txt': 'gone after update', 'unins000.exe': 'uninstaller' })
+    expect(fs.existsSync(path.join(t.path, OLD_DIR))).toBe(false)
+  })
+
+  test('cancelled while unpacking: nothing is moved, nothing is left', async () => {
+    const t = install('app')
+    const before = tree(t.path)
+    const ac = new AbortController()
+    ac.abort()
+    const err = await applyDirectoryUpdate(build('app'), t, { appName: 'App', platform: 'linux', signal: ac.signal }).catch((e) => e)
+    expect(err.code).toBe('cancelled')
+    expect(tree(t.path)).toEqual(before)
+    expect(fs.existsSync(path.join(t.path, NEW_DIR))).toBe(false)
+  })
 })

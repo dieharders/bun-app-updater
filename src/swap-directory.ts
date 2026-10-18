@@ -22,7 +22,12 @@
  *
  * Windows can refuse a rename for a moment for reasons that have nothing to do with the app:
  * an antivirus scanning the new files, the search indexer, an Explorer window open in the
- * folder. Each move is retried a few times before it counts as a failure.
+ * folder. Each move is retried a few times before it counts as a failure, the rollback's too.
+ *
+ * AN ORIGINAL THE ROLLBACK COULD NOT PUT BACK IS NEVER REMOVED. `.update-old` is then the only
+ * copy of it, so the folder stays, with a restore list naming what is still in it, and
+ * `restoreSetAside` puts those back at the next launch or before the next install, whichever
+ * comes first. Until then nothing removes `.update-old`.
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -32,6 +37,10 @@ import { applyZipModes, unzipToDir } from './zip'
 
 export const NEW_DIR = '.update-new'
 export const OLD_DIR = '.update-old'
+/** In `.update-old`: the entries a failed rollback could not put back, as a JSON array of names. */
+const RESTORE_LIST = '.restore.json'
+/** In `.update-old`: where `restoreSetAside` moves the update's copy of an entry out of the way. */
+const DISPLACED = '.displaced'
 
 export interface DirectorySwapOptions {
   platform?: NodeJS.Platform
@@ -62,17 +71,27 @@ export async function applyDirectoryUpdate(zipPaths: string[], target: InstallTa
   const rename = opts.rename ?? fs.renameSync
   const delays = opts.retryDelaysMs ?? DEFAULT_RETRIES
 
+  // Before anything below removes .update-old: an earlier failed rollback's originals go back first.
+  if (!restoreSetAside(dir)) {
+    throw new UpdateError('swap_failed', `${opts.appName} couldn't put back the files an earlier update set aside. Restart ${opts.appName} and try again.`)
+  }
+
   fs.rmSync(fresh, { recursive: true, force: true })
   // Progress is over the archives' bytes together, so the bar does not restart per part.
   const sizes = zipPaths.map((z) => fs.statSync(z).size)
   const totalBytes = sizes.reduce((a, b) => a + b, 0)
   let doneBefore = 0
   const topLevel = new Set<string>()
-  for (const [i, zipPath] of zipPaths.entries()) {
-    const result = await unzipToDir(zipPath, fresh, { signal: opts.signal, onProgress: (done) => opts.onUnpackProgress?.(doneBefore + done, totalBytes) })
-    applyZipModes(zipPath, fresh, platform)
-    for (const name of result.topLevel) topLevel.add(name)
-    doneBefore += sizes[i]!
+  try {
+    for (const [i, zipPath] of zipPaths.entries()) {
+      const result = await unzipToDir(zipPath, fresh, { signal: opts.signal, onProgress: (done) => opts.onUnpackProgress?.(doneBefore + done, totalBytes) })
+      applyZipModes(zipPath, fresh, platform)
+      for (const name of result.topLevel) topLevel.add(name)
+      doneBefore += sizes[i]!
+    }
+  } catch (err) {
+    removeQuietly(fresh)
+    throw err
   }
 
   if (opts.expect) {
@@ -111,47 +130,47 @@ export async function applyDirectoryUpdate(zipPaths: string[], target: InstallTa
     }
   }
 
-  // What has been moved so far, for the rollback: [installed path, set-aside path, new path].
-  const applied: { place: string; aside: string | null; incoming: string }[] = []
+  // What has been moved so far, for the rollback: the installed path, where the original was set
+  // aside (null when there was none), where the new one came from, and whether it is in place yet.
+  const applied: { name: string; place: string; aside: string | null; incoming: string; movedIn: boolean }[] = []
   try {
     for (const name of entries) {
       const place = path.join(dir, name)
-      const incoming = path.join(fresh, name)
-      const aside = path.join(old, name)
-      const existed = fs.existsSync(place)
-      if (existed) await moveWithRetry(place, aside)
-      applied.push({ place, aside: existed ? aside : null, incoming })
-      try {
-        await moveWithRetry(incoming, place)
-      } catch (err) {
-        // The set-aside succeeded and the move-in failed: put the set-aside back before the
-        // general rollback, which only knows about completed pairs.
-        applied.pop()
-        if (existed) {
-          try {
-            rename(aside, place)
-          } catch {
-            // Left for the rollback below to report; the user's copy is in .update-old.
-          }
-        }
-        throw err
+      const step = { name, place, aside: null as string | null, incoming: path.join(fresh, name), movedIn: false }
+      if (fs.existsSync(place)) {
+        await moveWithRetry(place, path.join(old, name))
+        step.aside = path.join(old, name)
       }
+      applied.push(step)
+      await moveWithRetry(step.incoming, place)
+      step.movedIn = true
     }
   } catch (err) {
+    // Undone in reverse. An original that cannot be put back is left in .update-old and named
+    // in the restore list; the folder is its only copy now, so it is kept.
+    const stranded: string[] = []
     for (const step of applied.reverse()) {
       try {
-        rename(step.place, step.incoming)
-        if (step.aside) rename(step.aside, step.place)
+        if (step.movedIn) await moveWithRetry(step.place, step.incoming)
+        if (step.aside) await moveWithRetry(step.aside, step.place)
       } catch {
-        // Rollback is best effort; what it could not restore is still in .update-old.
+        if (step.aside) stranded.push(step.name)
       }
     }
-    fs.rmSync(fresh, { recursive: true, force: true })
-    try {
-      fs.rmSync(old, { recursive: true, force: true })
-    } catch {
-      // Still held; the next launch tries again.
+    removeQuietly(fresh)
+    if (stranded.length > 0) {
+      try {
+        fs.writeFileSync(path.join(old, RESTORE_LIST), JSON.stringify(stranded))
+      } catch {
+        // Nothing more to do from here; the folder itself is kept.
+      }
+      throw new UpdateError(
+        'swap_failed',
+        `${opts.appName} couldn't swap the update in or put all of its own files back. Restart ${opts.appName} to finish putting them back, or reinstall it if it won't start.`,
+        { cause: err },
+      )
     }
+    removeQuietly(old)
     const code = (err as NodeJS.ErrnoException).code
     const entry = (err as NodeJS.ErrnoException).path ? ` (${path.basename((err as NodeJS.ErrnoException).path!)})` : ''
     if (code === 'EPERM' || code === 'EACCES' || code === 'EBUSY') {
@@ -164,14 +183,72 @@ export async function applyDirectoryUpdate(zipPaths: string[], target: InstallTa
     throw new UpdateError('swap_failed', `${opts.appName} couldn't swap the update in${entry}.`, { cause: err })
   }
 
-  fs.rmSync(fresh, { recursive: true, force: true })
+  // The update is in place: what is left is cleanup, and cleanUpAfterUpdate retries it.
+  removeQuietly(fresh)
   // The old executable is still running. On POSIX its file can be unlinked anyway; Windows
   // keeps it locked, so the next launch removes it.
-  if (platform !== 'win32') {
+  if (platform !== 'win32') removeQuietly(old)
+}
+
+/**
+ * Put back the originals a failed rollback left in `.update-old`, as its restore list names
+ * them. Where the update's copy of an entry is still in place, it is moved out of the way first.
+ *
+ * True when nothing is left to put back, so `.update-old` may be removed. False while something
+ * is: the folder is the only copy of it then, and must be kept.
+ */
+export function restoreSetAside(dir: string): boolean {
+  const old = path.join(dir, OLD_DIR)
+  const list = path.join(old, RESTORE_LIST)
+  if (!exists(list)) return true
+  let names: unknown
+  try {
+    names = JSON.parse(fs.readFileSync(list, 'utf8'))
+  } catch {
+    return false
+  }
+  if (!Array.isArray(names)) return false
+  const left = names.filter((name: unknown) => {
+    // Written by the rollback above, so always a top-level entry's name; anything else is skipped.
+    if (typeof name !== 'string' || !name || /[\\/]/.test(name) || name === '.' || name === '..') return false
+    const aside = path.join(old, name)
+    const place = path.join(dir, name)
+    if (!exists(aside)) return false
     try {
-      fs.rmSync(old, { recursive: true, force: true })
+      if (exists(place)) {
+        const displaced = path.join(old, DISPLACED, name)
+        fs.mkdirSync(path.dirname(displaced), { recursive: true })
+        fs.rmSync(displaced, { recursive: true, force: true })
+        fs.renameSync(place, displaced)
+      }
+      fs.renameSync(aside, place)
+      return false
     } catch {
-      // Left for cleanUpAfterUpdate.
+      return true
     }
+  })
+  try {
+    if (left.length > 0) fs.writeFileSync(list, JSON.stringify(left))
+    else fs.rmSync(list, { force: true })
+  } catch {
+    return false
+  }
+  return left.length === 0
+}
+
+const exists = (p: string): boolean => {
+  try {
+    fs.lstatSync(p)
+    return true
+  } catch {
+    return false
+  }
+}
+
+const removeQuietly = (p: string): void => {
+  try {
+    fs.rmSync(p, { recursive: true, force: true })
+  } catch {
+    // Still held; cleanUpAfterUpdate tries again at the next launch.
   }
 }
