@@ -24,7 +24,7 @@ beforeAll(() => {
     port: 0,
     fetch: (req) => {
       const body = served.get(new URL(req.url).pathname.slice(1))
-      return body ? new Response(new Blob([body])) : new Response('nope', { status: 404 })
+      return body ? new Response(new Uint8Array(body)) : new Response('nope', { status: 404 })
     },
   })
   base = `http://127.0.0.1:${server.port}`
