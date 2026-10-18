@@ -81,9 +81,12 @@ export async function applyBundleUpdate(zipPath: string, target: InstallTarget, 
   fs.rmSync(old, { recursive: true, force: true })
 }
 
-/** Run a macOS tool. When it fails, throws `message` with what the tool said. */
+/**
+ * Run a macOS tool. When it fails, throws `message`, which the user sees; what the tool said goes
+ * in `cause`, for the log. Its stderr names paths inside the install and reads as a crash report.
+ */
 async function run(cmd: string[], message: string, code: 'unpack_failed' | 'damaged'): Promise<void> {
   const proc = Bun.spawn(cmd, { stdout: 'ignore', stderr: 'pipe' })
   const [err, exit] = await Promise.all([new Response(proc.stderr).text(), proc.exited])
-  if (exit !== 0) throw new UpdateError(code, `${message}: ${err.trim()}`)
+  if (exit !== 0) throw new UpdateError(code, `${message}.`, { cause: new Error(`${path.basename(cmd[0]!)} exited ${exit}: ${err.trim()}`) })
 }

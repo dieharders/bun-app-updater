@@ -66,6 +66,9 @@ describe.skipIf(!darwin)('applyBundleUpdate', () => {
     await run(['ditto', '-c', '-k', '--keepParent', tampered, badZip])
     const err = await applyBundleUpdate(badZip, target, { appName: 'Tiny', bundleExecutable: 'tiny' }).catch((e) => e)
     expect(err.code).toBe('damaged')
+    // The message is shown to the user: no paths, no codesign output. That is kept for the log.
+    expect(err.message).toBe("The update's signature doesn't check out.")
+    expect(err.cause.message).toMatch(/^codesign exited \d+: .*Tiny\.app/)
     expect(fs.readFileSync(path.join(oldApp, 'Contents/MacOS/tiny'), 'utf8')).toContain('echo old')
     expect(fs.readdirSync(path.dirname(oldApp))).toEqual(['Tiny.app'])
   })
