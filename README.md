@@ -1,11 +1,9 @@
 # @suite/updater
 
-In-app updates for a Bun desktop app: check a release feed, download this platform's build,
-verify it, swap it in by rename, relaunch. It knows nothing about any particular app — the app
-supplies a config and two routes.
+In-app updates for a Bun app: check a release feed, download this platform's build,
+verify it, swap it in by rename, relaunch. The app supplies a config and two routes.
 
-Written for MotionBuff, modelled on Mudd's updater, and meant to be **copied into any other Bun
-app as one folder**. Its only dependency is `fflate`.
+Its only dependency is `fflate`.
 
 ## What it assumes about the app
 
@@ -27,7 +25,7 @@ app as one folder**. Its only dependency is `fflate`.
   and SHA-256 and a content hash of the entry (`hashTree` in `tree-hash.ts`); the updater hashes
   the installed entries and downloads only those that differ. The zips:
   - macOS: the whole `.app` as the one part — `ditto -c -k --norsrc --noextattr --keepParent
-    App.app out.zip` (the updater unpacks with ditto and runs `codesign --verify --deep --strict`
+App.app out.zip` (the updater unpacks with ditto and runs `codesign --verify --deep --strict`
     before swapping). A bundle update is always the whole download: the seal covers it all.
   - Windows: `tar -a -cf out.zip -C <dir> <entry>` (bsdtar, in Windows 10 since 1803), one entry
     per zip
@@ -45,17 +43,21 @@ app as one folder**. Its only dependency is `fflate`.
 2. Configure it once, somewhere both the server and the window thread can import:
 
    ```ts
-   import { createUpdater, githubReleases } from '@suite/updater'
-   import { version } from '../package.json'
+   import { createUpdater, githubReleases } from "@suite/updater";
+   import { version } from "../package.json";
 
    export const updater = createUpdater({
-     appName: 'MyApp',
+     appName: "MyApp",
      version,
-     source: githubReleases({ repo: 'me/myapp', tagPrefix: 'v', userAgent: 'MyApp' }),
+     source: githubReleases({
+       repo: "me/myapp",
+       tagPrefix: "v",
+       userAgent: "MyApp",
+     }),
      manifestName: (v, target) => `MyApp-${v}-${target}.manifest.json`,
-     bundleExecutable: 'myapp',            // macOS: the name under Contents/MacOS
-     busy: () => (jobsRunning() ? 'a job is running' : null),
-   })
+     bundleExecutable: "myapp", // macOS: the name under Contents/MacOS
+     busy: () => (jobsRunning() ? "a job is running" : null),
+   });
    ```
 
    `busy()` is asked before the download and again before the swap: the swap moves the
@@ -64,8 +66,8 @@ app as one folder**. Its only dependency is `fflate`.
 3. Two routes on your `Bun.serve`, behind whatever origin check your other routes use:
 
    ```ts
-   import { updateHttp } from '@suite/updater'
-   const http = updateHttp(updater)
+   import { updateHttp } from "@suite/updater";
+   const http = updateHttp(updater);
    // GET  /api/update            -> http.check(req)    JSON UpdateInfo (`?force=1` re-asks the feed)
    // POST /api/update/install    -> http.install(req)  SSE stream of InstallEvent, ending in `done`
    ```
@@ -73,19 +75,27 @@ app as one folder**. Its only dependency is `fflate`.
 4. In `main.ts`, before the server starts:
 
    ```ts
-   import { cleanUpAfterUpdate, relaunch, waitForArg, waitForExit } from '@suite/updater'
-   const replacing = waitForArg()
-   if (replacing) await waitForExit(replacing)   // the copy this one replaces frees the port
-   cleanUpAfterUpdate(updater.target())          // Windows: the old exe could not be deleted while it ran
+   import {
+     cleanUpAfterUpdate,
+     relaunch,
+     waitForArg,
+     waitForExit,
+   } from "@suite/updater";
+   const replacing = waitForArg();
+   if (replacing) await waitForExit(replacing); // the copy this one replaces frees the port
+   cleanUpAfterUpdate(updater.target()); // Windows: the old exe could not be deleted while it ran
    ```
 
    and after the window closes, if the page asked for a restart:
 
    ```ts
-   webview.bind('__myappRestart', () => { restartRequested = true; endTheEventLoop() })
+   webview.bind("__myappRestart", () => {
+     restartRequested = true;
+     endTheEventLoop();
+   });
    // … webview.run() returns, shut down the server …
-   if (restartRequested) updater.relaunch()
-   process.exit(0)
+   if (restartRequested) updater.relaunch();
+   process.exit(0);
    ```
 
    With webview-bun, ending the loop from a bound callback is `lib.symbols.webview_terminate(webview.unsafeHandle)`
@@ -102,15 +112,19 @@ app as one folder**. Its only dependency is `fflate`.
    the staged install tree:
 
    ```ts
-   import { writeUpdateParts } from '@suite/updater'
+   import { writeUpdateParts } from "@suite/updater";
    await writeUpdateParts({
-     sourceDir: 'dist/native', outDir: 'dist/update', version, target, platform: process.platform,
+     sourceDir: "dist/native",
+     outDir: "dist/update",
+     version,
+     target,
+     platform: process.platform,
      manifestName: `MyApp-${version}-${target}.manifest.json`,
      partName: (entry) => `MyApp-${version}-${target}-${entry}.zip`,
-     bundle: 'MyApp.app',                   // macOS only: the one part
-     required: ['myapp', 'vendor'],         // an incomplete build fails here
-     executables: ['vendor/ffmpeg'],        // Linux: must be recorded as executable
-   })
+     bundle: "MyApp.app", // macOS only: the one part
+     required: ["myapp", "vendor"], // an incomplete build fails here
+     executables: ["vendor/ffmpeg"], // Linux: must be recorded as executable
+   });
    ```
 
    It runs the platform's archiver, then reads every part back with this package's own
@@ -125,22 +139,22 @@ app as one folder**. Its only dependency is `fflate`.
 
 ## The pieces
 
-| Module | What it does |
-|---|---|
-| `version` | strict `X.Y.Z` parse and compare |
-| `source` | `ReleaseSource`, `githubReleases`, `jsonRelease`, `staticRelease` |
-| `target` | `installTarget` (what is replaced), `blockedReason` (why it cannot be), `targetName` |
-| `manifest` | the release's manifest: one part per top-level entry, with sizes, SHA-256s and content hashes |
-| `tree-hash` | `hashTree`: one SHA-256 for a file or a directory's content, the same wherever it sits |
-| `parts` | `writeUpdateParts`: the build side — archive each entry, write the manifest, read it all back |
-| `feed` | `writeLocalFeed`: a `release.json` of `file:` URLs over those parts, for rehearsing an update with nothing published |
-| `download` | stream to a `.partial` file, hash as it goes, verify size and SHA-256 (a missing checksum is refused) |
-| `zip` | streaming unpack (fflate), a central-directory reader for modes and symlinks, unsafe-path refusal |
-| `swap-directory` | unpack the parts into `.update-new/`, move entries aside into `.update-old/`, new ones in, roll back on failure |
-| `swap-bundle` | ditto, codesign verify, rename the `.app` |
-| `relaunch` | `--wait-for=<pid>`, `waitForExit`, `relaunch` (`open -n` on macOS), `cleanUpAfterUpdate` |
-| `updater` | the facade: check cache, the per-release plan (which parts, how many bytes), single-flight, `installedVersion`, events |
-| `http` | the two routes, for any `Bun.serve` |
+| Module           | What it does                                                                                                           |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `version`        | strict `X.Y.Z` parse and compare                                                                                       |
+| `source`         | `ReleaseSource`, `githubReleases`, `jsonRelease`, `staticRelease`                                                      |
+| `target`         | `installTarget` (what is replaced), `blockedReason` (why it cannot be), `targetName`                                   |
+| `manifest`       | the release's manifest: one part per top-level entry, with sizes, SHA-256s and content hashes                          |
+| `tree-hash`      | `hashTree`: one SHA-256 for a file or a directory's content, the same wherever it sits                                 |
+| `parts`          | `writeUpdateParts`: the build side — archive each entry, write the manifest, read it all back                          |
+| `feed`           | `writeLocalFeed`: a `release.json` of `file:` URLs over those parts, for rehearsing an update with nothing published   |
+| `download`       | stream to a `.partial` file, hash as it goes, verify size and SHA-256 (a missing checksum is refused)                  |
+| `zip`            | streaming unpack (fflate), a central-directory reader for modes and symlinks, unsafe-path refusal                      |
+| `swap-directory` | unpack the parts into `.update-new/`, move entries aside into `.update-old/`, new ones in, roll back on failure        |
+| `swap-bundle`    | ditto, codesign verify, rename the `.app`                                                                              |
+| `relaunch`       | `--wait-for=<pid>`, `waitForExit`, `relaunch` (`open -n` on macOS), `cleanUpAfterUpdate`                               |
+| `updater`        | the facade: check cache, the per-release plan (which parts, how many bytes), single-flight, `installedVersion`, events |
+| `http`           | the two routes, for any `Bun.serve`                                                                                    |
 
 `bun test ./src/` runs everything on scratch directories; the macOS bundle swap test builds and
 signs a tiny real `.app`.
