@@ -3,13 +3,21 @@ export { ReleaseFeedError, githubReleases, jsonRelease, staticRelease, type Fetc
 export { blockedReason, freeBytes, installTarget, targetName, type InstallTarget, type Layout } from './target'
 export { UpdateError, type InstallErrorCode } from './errors'
 export { downloadTo } from './download'
-export { hashTree } from './tree-hash'
-export { writeUpdateParts, type WritePartsOptions, type WrittenParts } from './parts'
 export { writeLocalFeed, type WriteFeedOptions, type WrittenFeed } from './feed'
-export { MANIFEST_FORMAT, parseManifest, type UpdateManifest, type UpdatePart } from './manifest'
-export { applyZipModes, readZipEntries, safeEntryPath, unzipToDir, type ZipEntry } from './zip'
-export { applyDirectoryUpdate, NEW_DIR, OLD_DIR } from './swap-directory'
-export { applyBundleUpdate } from './swap-bundle'
-export { cleanUpAfterUpdate, relaunch, waitForArg, waitForExit, WAIT_FOR_FLAG } from './relaunch'
+export { applyBundleUpdate, exchangePaths } from './swap-bundle'
+export {
+  cleanUpAfterUpdate,
+  finishUpdate,
+  isAlive,
+  pendingInstaller,
+  relaunch,
+  stageDir,
+  waitForArg,
+  waitForExit,
+  WAIT_FOR_FLAG,
+  type FinishOptions,
+  type InstallerHandoff,
+  type PendingInstaller,
+} from './relaunch'
 export { createUpdater, type InstallEvent, type InstallEventSink, type UpdateInfo, type Updater, type UpdaterConfig } from './updater'
 export { updateHttp, SSE_HEADERS, type UpdateHttp } from './http'

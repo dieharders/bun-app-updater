@@ -1,14 +1,16 @@
 /**
- * The macOS swap on a real, tiny, ad-hoc signed bundle. Only runs on macOS: it needs ditto and
- * codesign, and the bundle layout means nothing elsewhere.
+ * The macOS swap on a real, tiny, ad-hoc signed bundle on a real disk image. Only runs on macOS:
+ * it needs hdiutil, ditto and codesign, and the bundle layout means nothing elsewhere.
  */
 import { afterAll, describe, expect, test } from 'bun:test'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { applyBundleUpdate } from './swap-bundle'
+import { STAGING_PID, applyBundleUpdate, exchangePaths } from './swap-bundle'
 
 const darwin = process.platform === 'darwin'
+/** hdiutil create and attach take seconds each, past bun's 5s default. */
+const SLOW = 60_000
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'updater-bundle-'))
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }))
 
@@ -34,83 +36,103 @@ const makeApp = async (dir: string, marker: string): Promise<string> => {
   return app
 }
 
+/** A DMG laid out the way a release's is: the app and a link to /Applications. */
+const makeDmg = async (name: string, fill: (dir: string) => Promise<void>): Promise<string> => {
+  const src = fs.mkdtempSync(path.join(tmp, `${name}-src-`))
+  await fill(src)
+  fs.symlinkSync('/Applications', path.join(src, 'Applications'))
+  const dmg = path.join(tmp, `${name}.dmg`)
+  await run(['hdiutil', 'create', '-volname', 'Tiny', '-srcfolder', src, '-fs', 'HFS+', '-format', 'UDZO', '-ov', dmg])
+  return dmg
+}
+const newDmg = (name: string) => makeDmg(name, (dir) => makeApp(dir, 'new').then(() => {}))
+
+const installed = async (name: string) => {
+  const app = await makeApp(fs.mkdtempSync(path.join(tmp, `${name}-`)), 'old')
+  return { app, target: { layout: 'bundle' as const, path: app, executable: path.join(app, 'Contents/MacOS/tiny') } }
+}
+const opts = { appName: 'Tiny', bundleExecutable: 'tiny' }
+const mounts = () => fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('tiny-update-mount-'))
+
 describe.skipIf(!darwin)('applyBundleUpdate', () => {
-  test('the new bundle takes the old one\'s place, sealed, symlinks intact, nothing left beside it', async () => {
-    const oldApp = await makeApp(fs.mkdtempSync(path.join(tmp, 'installed-')), 'old')
-    const newApp = await makeApp(fs.mkdtempSync(path.join(tmp, 'build-')), 'new')
-    const zip = path.join(tmp, 'Tiny-new.zip')
-    await run(['ditto', '-c', '-k', '--norsrc', '--noextattr', '--keepParent', newApp, zip])
-
+  test('the new bundle takes the old one\'s place, sealed, symlinks intact, nothing left beside it or mounted', async () => {
+    const { app, target } = await installed('installed')
+    const before = mounts()
     const events: string[] = []
-    await applyBundleUpdate(zip, { layout: 'bundle', path: oldApp, executable: path.join(oldApp, 'Contents/MacOS/tiny') }, { appName: 'Tiny', bundleExecutable: 'tiny', onSwapping: () => events.push('swapping') })
+    await applyBundleUpdate(await newDmg('build'), target, { ...opts, onSwapping: () => events.push('swapping') })
     expect(events).toEqual(['swapping'])
-    expect(fs.readFileSync(path.join(oldApp, 'Contents/MacOS/tiny'), 'utf8')).toContain('echo new')
-    expect(fs.lstatSync(path.join(oldApp, 'Contents/MacOS/vendor')).isSymbolicLink()).toBe(true)
-    expect(fs.readFileSync(path.join(oldApp, 'Contents/MacOS/vendor/tool'), 'utf8')).toBe('new')
-    expect(fs.readdirSync(path.dirname(oldApp))).toEqual(['Tiny.app'])
-    await run(['codesign', '--verify', '--deep', '--strict', oldApp])
-  })
+    expect(fs.readFileSync(path.join(app, 'Contents/MacOS/tiny'), 'utf8')).toContain('echo new')
+    expect(fs.lstatSync(path.join(app, 'Contents/MacOS/vendor')).isSymbolicLink()).toBe(true)
+    expect(fs.readFileSync(path.join(app, 'Contents/MacOS/vendor/tool'), 'utf8')).toBe('new')
+    expect(fs.readdirSync(path.dirname(app))).toEqual(['Tiny.app'])
+    expect(mounts()).toEqual(before)
+    await run(['codesign', '--verify', '--deep', '--strict', app])
+  }, SLOW)
 
-  test('a zip without the app in it, and a tampered bundle, change nothing', async () => {
-    const oldApp = await makeApp(fs.mkdtempSync(path.join(tmp, 'installed2-')), 'old')
-    const target = { layout: 'bundle' as const, path: oldApp, executable: path.join(oldApp, 'Contents/MacOS/tiny') }
-    const other = fs.mkdtempSync(path.join(tmp, 'other-'))
-    fs.writeFileSync(path.join(other, 'readme.txt'), 'x')
-    const noApp = path.join(tmp, 'noapp.zip')
-    await run(['ditto', '-c', '-k', other, noApp])
-    await expect(applyBundleUpdate(noApp, target, { appName: 'Tiny', bundleExecutable: 'tiny' })).rejects.toThrow(/no Tiny app/)
+  test('a disk image without the app on it, and a tampered bundle, change nothing', async () => {
+    const { app, target } = await installed('installed2')
+    const noApp = await makeDmg('noapp', async (dir) => fs.writeFileSync(path.join(dir, 'readme.txt'), 'x'))
+    await expect(applyBundleUpdate(noApp, target, opts)).rejects.toThrow(/no Tiny app/)
+    expect(fs.readdirSync(path.dirname(app))).toEqual(['Tiny.app'])
 
-    const tampered = await makeApp(fs.mkdtempSync(path.join(tmp, 'tampered-')), 'new')
-    fs.writeFileSync(path.join(tampered, 'Contents/Resources/vendor/tool'), 'edited after signing')
-    const badZip = path.join(tmp, 'tampered.zip')
-    await run(['ditto', '-c', '-k', '--keepParent', tampered, badZip])
-    const err = await applyBundleUpdate(badZip, target, { appName: 'Tiny', bundleExecutable: 'tiny' }).catch((e) => e)
+    const tampered = await makeDmg('tampered', async (dir) => {
+      const built = await makeApp(dir, 'new')
+      fs.writeFileSync(path.join(built, 'Contents/Resources/vendor/tool'), 'edited after signing')
+    })
+    const err = await applyBundleUpdate(tampered, target, opts).catch((e) => e)
     expect(err.code).toBe('damaged')
     // The message is shown to the user: no paths, no codesign output. That is kept for the log.
     expect(err.message).toBe("The update's signature doesn't check out.")
     expect(err.cause.message).toMatch(/^codesign exited \d+: .*Tiny\.app/)
-    expect(fs.readFileSync(path.join(oldApp, 'Contents/MacOS/tiny'), 'utf8')).toContain('echo old')
-    expect(fs.readdirSync(path.dirname(oldApp))).toEqual(['Tiny.app'])
-  })
+    expect(fs.readFileSync(path.join(app, 'Contents/MacOS/tiny'), 'utf8')).toContain('echo old')
+    expect(fs.readdirSync(path.dirname(app))).toEqual(['Tiny.app'])
+  }, SLOW)
 
-  const newZip = async (name: string) => {
-    const zip = path.join(tmp, `${name}.zip`)
-    await run(['ditto', '-c', '-k', '--norsrc', '--noextattr', '--keepParent', await makeApp(fs.mkdtempSync(path.join(tmp, `${name}-`)), 'new'), zip])
-    return zip
-  }
-  const targetOf = (app: string) => ({ layout: 'bundle' as const, path: app, executable: path.join(app, 'Contents/MacOS/tiny') })
+  test('a file that is not a disk image is refused as unopenable', async () => {
+    const { app, target } = await installed('installed3')
+    const junk = path.join(tmp, 'junk.dmg')
+    fs.writeFileSync(junk, 'not a disk image')
+    const err = await applyBundleUpdate(junk, target, opts).catch((e) => e)
+    expect(err.code).toBe('unpack_failed')
+    expect(err.message).toBe("The update's download couldn't be opened.")
+    expect(fs.readdirSync(path.dirname(app))).toEqual(['Tiny.app'])
+  }, SLOW)
 
-  test('a swap that cannot put the app back leaves it at .old, and the next swap puts it back before anything else', async () => {
-    const oldApp = await makeApp(fs.mkdtempSync(path.join(tmp, 'installed3-')), 'old')
-    const zip = await newZip('build3')
-    // The new bundle will not move in, and the old one will not move back.
-    const rename = (from: string, to: string) => {
-      if (to === oldApp) throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' })
-      fs.renameSync(from, to)
+  test('an exchange the volume refuses leaves the app as it was, and the staged copy gone', async () => {
+    const { app, target } = await installed('installed4')
+    let staged: string[] = []
+    const exchange = (a: string) => {
+      staged = fs.readdirSync(path.dirname(a))
+      throw Object.assign(new Error('renamex_np(RENAME_SWAP) failed with errno 45'), { errno: 45 })
     }
-    const err = await applyBundleUpdate(zip, targetOf(oldApp), { appName: 'Tiny', bundleExecutable: 'tiny', rename }).catch((e) => e)
+    const err = await applyBundleUpdate(await newDmg('build4'), target, { ...opts, exchange }).catch((e) => e)
     expect(err.code).toBe('swap_failed')
-    expect(err.message).toBe("Tiny couldn't swap the update in or put itself back. In the folder Tiny was in, rename Tiny.app.old to Tiny.app.")
-    expect(fs.readdirSync(path.dirname(oldApp))).toEqual(['Tiny.app.old'])
+    expect(err.message).toBe("Tiny can't replace itself where it's installed. Download the update instead.")
+    expect(staged.sort()).toEqual([STAGING_PID, 'Tiny.app'].sort()) // staged beside the app, with its owner
+    expect(fs.readFileSync(path.join(app, 'Contents/MacOS/tiny'), 'utf8')).toContain('echo old')
+    expect(fs.readdirSync(path.dirname(app))).toEqual(['Tiny.app'])
+  }, SLOW)
 
-    await applyBundleUpdate(zip, targetOf(oldApp), { appName: 'Tiny', bundleExecutable: 'tiny' })
-    expect(fs.readFileSync(path.join(oldApp, 'Contents/MacOS/tiny'), 'utf8')).toContain('echo new')
-    expect(fs.readdirSync(path.dirname(oldApp))).toEqual(['Tiny.app'])
-  })
+  test('a cancel before the swap changes nothing', async () => {
+    const { app, target } = await installed('installed5')
+    const ac = new AbortController()
+    const err = await applyBundleUpdate(await newDmg('build5'), target, { ...opts, signal: ac.signal, onSwapping: () => ac.abort() }).catch((e) => e)
+    expect(err.code).toBe('cancelled')
+    expect(fs.readFileSync(path.join(app, 'Contents/MacOS/tiny'), 'utf8')).toContain('echo old')
+    expect(fs.readdirSync(path.dirname(app))).toEqual(['Tiny.app'])
+  }, SLOW)
+})
 
-  test.skipIf(process.getuid?.() === 0)('an old bundle that will not be removed does not fail a swap that worked', async () => {
-    const oldApp = await makeApp(fs.mkdtempSync(path.join(tmp, 'installed4-')), 'old')
-    // A vendored toolchain's read-only folder: rm can't empty it.
-    const locked = path.join(oldApp, 'Contents', 'Resources', 'locked')
-    fs.mkdirSync(locked)
-    fs.writeFileSync(path.join(locked, 'tool'), 'x')
-    fs.chmodSync(locked, 0o555)
-    try {
-      await applyBundleUpdate(await newZip('build4'), targetOf(oldApp), { appName: 'Tiny', bundleExecutable: 'tiny', verifySignature: false })
-      expect(fs.readFileSync(path.join(oldApp, 'Contents/MacOS/tiny'), 'utf8')).toContain('echo new')
-      expect(fs.existsSync(`${oldApp}.old`)).toBe(true) // left for the next launch's cleanup
-    } finally {
-      fs.chmodSync(path.join(`${oldApp}.old`, 'Contents', 'Resources', 'locked'), 0o755)
-    }
+describe.skipIf(!darwin)('exchangePaths', () => {
+  test('swaps two folders in one step, and refuses a path that is not there', () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'exchange-'))
+    fs.mkdirSync(path.join(dir, 'a'))
+    fs.writeFileSync(path.join(dir, 'a', 'which'), 'a')
+    fs.mkdirSync(path.join(dir, 'b'))
+    fs.writeFileSync(path.join(dir, 'b', 'which'), 'b')
+    exchangePaths(path.join(dir, 'a'), path.join(dir, 'b'))
+    expect(fs.readFileSync(path.join(dir, 'a', 'which'), 'utf8')).toBe('b')
+    expect(fs.readFileSync(path.join(dir, 'b', 'which'), 'utf8')).toBe('a')
+    expect(() => exchangePaths(path.join(dir, 'a'), path.join(dir, 'missing'))).toThrow(/errno 2\b/)
   })
 })

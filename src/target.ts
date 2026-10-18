@@ -7,8 +7,8 @@
  *              codesigned as a whole, so the smallest thing that can be replaced without
  *              breaking the seal is the whole `.app`. The target is the bundle.
  *   directory  Windows and Linux. The executable sits in a directory with whatever the build
- *              staged beside it (a vendored toolchain, assets). The target is that directory,
- *              and the update replaces the entries the new build carries, entry by entry.
+ *              staged beside it (a vendored toolchain, assets). The target is that directory;
+ *              on Windows the app's installer is run into it as the app quits.
  *
  * Running from source — `bun run main.ts`, where the executable is Bun itself — has no target.
  * An update then has nothing to replace, and the UI offers the download page instead.

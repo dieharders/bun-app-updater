@@ -1,41 +1,35 @@
 # bun-app-updater
 
-In-app updates for a Bun app: check a release feed, download this platform's build,
-verify it, swap it in by rename, relaunch. The app supplies a config and two routes.
+In-app updates for a Bun app: check a release feed, download this platform's release, verify
+it, install it, relaunch. The app supplies a config and two routes.
 
-Its only dependency is `fflate`.
+It has no dependencies.
 
 ## What it assumes about the app
 
 - A `bun build --compile` executable, installed in one of two layouts:
+  - **bundle** (macOS): `<Name>.app/Contents/MacOS/<exe>`, codesigned.
   - **directory** (Windows, Linux): the executable in a directory, with whatever the build
-    staged beside it. The update replaces the entries the new build carries and leaves the rest
-    (an installer's uninstaller, a browser profile folder) alone.
-  - **bundle** (macOS): `<Name>.app/Contents/MacOS/<exe>`, codesigned. The whole `.app` is
-    replaced, because replacing anything inside it breaks the seal.
+    staged beside it.
+- A release is installed **whole, from the file a person downloads**. `assetName(version,
+  target)` names it, where `target` is `windows-x64`, `darwin-arm64`, `linux-x64`, …:
+  - **macOS: the DMG.** The updater mounts it read-only, copies the `.app` out beside the
+    installed one with `ditto`, runs `codesign --verify --deep --strict`, and exchanges the two
+    in one atomic step (`renamex_np` with `RENAME_SWAP`). The restart starts the new copy.
+  - **Windows: the installer.** The updater downloads and verifies it, and nothing is replaced
+    while the app runs: the installer is started as the app quits, with the arguments the app's
+    `installer` config gives it — install unattended into the current folder, wait for the
+    app's process to exit, and start the app again when the user asked for a restart.
+  - **Linux: nothing in place.** A package install needs root. `check()` reports why, and the
+    app offers the release page instead.
 - The install location is **writable by the user** (per-user installs on Windows, a dragged
   `.app` on macOS). Where it is not, `check()` says why and the app offers a download page.
 - A release feed. Built in: **GitHub Releases** (listed and filtered by tag prefix — never
   `/releases/latest`, which a repo shared with another project would hijack) and a **JSON
-  manifest** at any URL (for an app that hosts its own feed, and for testing against a local
-  file server).
-- Per platform in each release, a **manifest** named by `manifestName(version, target)` where
-  `target` is `windows-x64`, `darwin-arm64`, `linux-x64`, …, and **one zip per top-level
-  entry** of the install tree (`manifest.ts` has the shape). Each part records its zip's size
-  and SHA-256 and a content hash of the entry (`hashTree` in `tree-hash.ts`); the updater hashes
-  the installed entries and downloads only those that differ. The zips:
-  - macOS: the whole `.app` as the one part — `ditto -c -k --norsrc --noextattr --keepParent
-App.app out.zip` (the updater unpacks with ditto and runs `codesign --verify --deep --strict`
-    before swapping). A bundle update is always the whole download: the seal covers it all.
-  - Windows: `tar -a -cf out.zip -C <dir> <entry>` (bsdtar, in Windows 10 since 1803), one entry
-    per zip
-  - Linux: `cd <dir> && zip -r -y out.zip <entry>` (`-y` keeps symlinks; exec bits are read back
-    from the zip's central directory and restored)
-
-  The manifest is verified against the **digest the feed lists for it** (GitHub computes one for
-  every asset); a manifest with no digest is refused, never installed on trust. The parts are
-  verified against the manifest's SHA-256s, and against the feed's digests too when it lists
-  them.
+  release** at any URL (for an app that hosts its own feed, and for testing against a local
+  file).
+- The feed lists a **SHA-256 for the download** (GitHub computes one for every asset). A
+  download with no checksum is refused (`unverified`), never installed on trust.
 
 ## Installing it as a submodule
 
@@ -69,13 +63,12 @@ there is no build step) and pins the exact commit it was tested against.
    ```
 
    Bun links it at `app/node_modules/bun-app-updater` and records it in the lockfile by path.
-   `fflate`, its one dependency, is installed with it.
 
 3. Import it by name, including the subpaths:
 
    ```ts
    import { createUpdater, githubReleases } from "bun-app-updater";
-   import { writeUpdateParts } from "bun-app-updater/parts";
+   import { writeLocalFeed } from "bun-app-updater/feed";
    ```
 
 **Fresh clones and CI** need the submodule checked out before `bun install`, which refuses to run
@@ -94,14 +87,11 @@ git clone --recurse-submodules <your-app>      # or: git submodule update --init
 **Moving the pin.** The submodule is a commit, not a branch: `git -C packages/updater pull`
 (or `checkout <commit>`), run your app's tests, then commit the new pointer in your repo.
 Consumer-facing shapes — `UpdaterConfig`, `UpdateInfo`, `InstallEvent`, `InstallErrorCode`,
-`WritePartsOptions` and the manifest format — are versioned in `package.json`; a manifest
-format change also bumps `MANIFEST_FORMAT`, and an installed copy refuses a manifest of another
-format with a plain message rather than misreading it. So a format bump ships behind a release
-of the old format that already carries the new reader.
+`InstallerHandoff` — are versioned in `package.json`.
 
 Without a workspace, the same thing works with a path dependency
-(`"bun-app-updater": "file:./vendor/bun-app-updater"`) or by copying the folder in and running
-`bun add fflate`; the submodule is what keeps every app on one source.
+(`"bun-app-updater": "file:./vendor/bun-app-updater"`) or by copying the folder in; the
+submodule is what keeps every app on one source.
 
 ## Dropping it into an app
 
@@ -109,8 +99,16 @@ Without a workspace, the same thing works with a path dependency
 2. Configure it once, somewhere both the server and the window thread can import:
 
    ```ts
-   import { createUpdater, githubReleases } from "bun-app-updater";
+   import { createUpdater, githubReleases, type InstallerHandoff } from "bun-app-updater";
    import { version } from "../package.json";
+
+   // Windows: Inno Setup's flags, plus two of the app's own (see "The Windows installer" below).
+   export const installer: InstallerHandoff = {
+     args: ({ installDir, pid, relaunch }) => [
+       "/SILENT", "/NORESTART", `/DIR=${installDir}`, `/WAITPID=${pid}`,
+       ...(relaunch ? ["/RELAUNCH=1"] : []),
+     ],
+   };
 
    export const updater = createUpdater({
      appName: "MyApp",
@@ -120,14 +118,20 @@ Without a workspace, the same thing works with a path dependency
        tagPrefix: "v",
        userAgent: "MyApp",
      }),
-     manifestName: (v, target) => `MyApp-${v}-${target}.manifest.json`,
+     assetName: (_version, target) =>
+       target.startsWith("darwin") ? `MyApp-${target}.dmg`
+       : target === "windows-x64" ? "MyApp-windows-x64-setup.exe"
+       : null,
      bundleExecutable: "myapp", // macOS: the name under Contents/MacOS
+     installer,
      busy: () => (jobsRunning() ? "a job is running" : null),
    });
    ```
 
-   `busy()` is asked before the download and again before the swap: the swap moves the
-   directories the app's child processes run from, so it must only happen on an idle app.
+   `busy()` is asked before the download and again before the swap (macOS) or the hand-off to
+   the installer (Windows): either replaces what the app's child processes run from, so it must
+   only happen on an idle app. `installing()` and `installedVersion()` let the app refuse new
+   work from the moment an install starts until the restart.
 
 3. Two routes on your `Bun.serve`, behind whatever origin check your other routes use:
 
@@ -141,18 +145,13 @@ Without a workspace, the same thing works with a path dependency
 4. In `main.ts`, before the server starts:
 
    ```ts
-   import {
-     cleanUpAfterUpdate,
-     relaunch,
-     waitForArg,
-     waitForExit,
-   } from "bun-app-updater";
+   import { cleanUpAfterUpdate, finishUpdate, installTarget, waitForArg, waitForExit } from "bun-app-updater";
    const replacing = waitForArg();
    if (replacing) await waitForExit(replacing); // the copy this one replaces frees the port
-   cleanUpAfterUpdate(updater.target()); // Windows: the old exe could not be deleted while it ran
+   cleanUpAfterUpdate(installTarget(), { appName: "MyApp" }); // what an earlier update left behind
    ```
 
-   and after the window closes, if the page asked for a restart:
+   and after the window closes — whether the page asked for a restart or the user just closed it:
 
    ```ts
    webview.bind("__myappRestart", () => {
@@ -160,70 +159,59 @@ Without a workspace, the same thing works with a path dependency
      endTheEventLoop();
    });
    // … webview.run() returns, shut down the server …
-   if (restartRequested) await updater.relaunch();
+   await finishUpdate({ target: installTarget(), appName: "MyApp", installer, relaunch: restartRequested });
    process.exit(0);
    ```
 
-   Await it: on macOS `relaunch` goes through `open -n`, and if that fails it starts the
-   executable directly, which only a process still alive to see `open` fail can do.
+   `finishUpdate` runs a staged Windows installer (told to relaunch only when the user asked),
+   or on a restart starts the new copy. Await it: on macOS the relaunch goes through `open -n`,
+   and if that fails it starts the executable directly, which only a process still alive to see
+   `open` fail can do. If the Windows installer cannot be started, the app is started again as
+   it is, so a Restart never ends with no app.
 
    With webview-bun, ending the loop from a bound callback is `lib.symbols.webview_terminate(webview.unsafeHandle)`
    (`import { lib } from 'webview-bun/src/ffi'`); the class's `destroy()` would free the handle
    that `run()` frees again on return.
 
-5. In the page: poll `GET /api/update` (on load and every few hours — the server asks the feed at
-   most once per 30 minutes whatever the page does), show `latest`, `installed` and `blocked`,
-   stream `POST /api/update/install` and read `downloading` / `unpacking` for a progress bar,
-   and on `done.ok` call the restart binding. `latest.size` is what the install will download
-   (the stale parts, not the release), and `latest.parts` names them.
+5. In the page: poll `GET /api/update` (on load and every half hour — the server asks the feed at
+   most once per 30 minutes whatever the page does, and a failed check again after a minute),
+   show `latest`, `installed` and `blocked`, stream `POST /api/update/install` and read
+   `downloading` / `unpacking` for a progress bar, and on `done.ok` call the restart binding.
 
-6. At build time, write the parts and the manifest with `writeUpdateParts` (`parts.ts`), from
-   the staged install tree:
+6. To rehearse an update with nothing published, `writeLocalFeed({ dir, version, url })` writes
+   a `release.json` beside the build's downloads that `jsonRelease` reads; launch the copy to
+   update with its `file:` URL as the feed (MotionBuff's `bun run update:feed` prints the line).
+   The version must be higher than the copy being updated.
 
-   ```ts
-   import { writeUpdateParts } from "bun-app-updater";
-   await writeUpdateParts({
-     sourceDir: "dist/native",
-     outDir: "dist/update",
-     version,
-     target,
-     platform: process.platform,
-     manifestName: `MyApp-${version}-${target}.manifest.json`,
-     partName: (entry) => `MyApp-${version}-${target}-${entry}.zip`,
-     bundle: "MyApp.app", // macOS only: the one part
-     required: ["myapp", "vendor"], // an incomplete build fails here
-     executables: ["vendor/ffmpeg"], // Linux: must be recorded as executable
-   });
-   ```
+## The Windows installer
 
-   It runs the platform's archiver, then reads every part back with this package's own
-   reader, unpacks it the way the updater does and checks the content hash — a part whose
-   unpacked hash differed from the manifest's would be downloaded on every update forever, and
-   that is caught on the build machine. Publish everything in `outDir`.
+The app's installer has to do three things an ordinary install doesn't, and the arguments in
+`InstallerHandoff` are how it is told to. With Inno Setup:
 
-7. To rehearse an update with nothing published, `writeLocalFeed({ dir: outDir, url })` writes
-   a `release.json` beside the parts that `jsonRelease` reads, and launch the copy to update
-   with its `file:` URL as the feed (MotionBuff's `bun run update:feed` prints the line). The
-   parts must be a higher version than the copy being updated.
+- **Wait for the old process.** `/WAITPID=<pid>` is read in `InitializeSetup` (`OpenProcess` +
+  `WaitForSingleObject` from kernel32) so nothing is copied over the running executable.
+- **Start the app again when asked.** A `[Run]` entry with `Check:` on `/RELAUNCH=1`; the
+  ordinary `postinstall skipifsilent` entry does nothing in a silent install.
+- **Remove what the new version no longer ships.** `[Files]` only adds and overwrites, so the
+  folders the build owns are emptied first with `[InstallDelete]`.
+
+`/SILENT` shows the progress window and any error, which is what a user who pressed Restart
+should see; `/VERYSILENT /SUPPRESSMSGBOXES` would turn a failed install into an app that never
+came back.
 
 ## The pieces
 
-| Module           | What it does                                                                                                           |
-| ---------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `version`        | strict `X.Y.Z` parse and compare                                                                                       |
-| `source`         | `ReleaseSource`, `githubReleases`, `jsonRelease`, `staticRelease`                                                      |
-| `target`         | `installTarget` (what is replaced), `blockedReason` (why it cannot be), `targetName`                                   |
-| `manifest`       | the release's manifest: one part per top-level entry, with sizes, SHA-256s and content hashes                          |
-| `tree-hash`      | `hashTree`: one SHA-256 for a file or a directory's content, the same wherever it sits                                 |
-| `parts`          | `writeUpdateParts`: the build side — archive each entry, write the manifest, read it all back                          |
-| `feed`           | `writeLocalFeed`: a `release.json` of `file:` URLs over those parts, for rehearsing an update with nothing published   |
-| `download`       | stream to a `.partial` file, hash as it goes, verify size and SHA-256 (a missing checksum is refused)                  |
-| `zip`            | streaming unpack (fflate), a central-directory reader for modes and symlinks, unsafe-path refusal                      |
-| `swap-directory` | unpack the parts into `.update-new/`, move entries aside into `.update-old/`, new ones in, roll back on failure        |
-| `swap-bundle`    | ditto, codesign verify, rename the `.app`                                                                              |
-| `relaunch`       | `--wait-for=<pid>`, `waitForExit`, `relaunch` (`open -n` on macOS), `cleanUpAfterUpdate`                               |
-| `updater`        | the facade: check cache, the per-release plan (which parts, how many bytes), single-flight, `installedVersion`, events |
-| `http`           | the two routes, for any `Bun.serve`                                                                                    |
+| Module        | What it does                                                                                                         |
+| ------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `version`     | strict `X.Y.Z` parse and compare                                                                                     |
+| `source`      | `ReleaseSource`, `githubReleases`, `jsonRelease`, `staticRelease`                                                    |
+| `target`      | `installTarget` (what is replaced), `blockedReason` (why it cannot be), `targetName`                                 |
+| `download`    | stream to a `.partial` file, hash as it goes, verify size and SHA-256 (a missing checksum is refused)                |
+| `swap-bundle` | mount the DMG, ditto the `.app` out, codesign verify, exchange it with the installed one atomically                  |
+| `relaunch`    | `--wait-for=<pid>`, `waitForExit`, `relaunch` (`open -n` on macOS), `finishUpdate`, `cleanUpAfterUpdate`             |
+| `feed`        | `writeLocalFeed`: a `release.json` of `file:` URLs over a build's downloads, for rehearsing an update                 |
+| `updater`     | the facade: check cache, single-flight install, `installedVersion`, events                                           |
+| `http`        | the two routes, for any `Bun.serve`                                                                                  |
 
-`bun test ./src/` runs everything on scratch directories; the macOS bundle swap test builds and
-signs a tiny real `.app`.
+`bun test ./src/` runs everything on scratch directories; the macOS swap test builds, signs and
+packs a tiny real `.app` into a real disk image.

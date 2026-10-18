@@ -1,7 +1,7 @@
 {
   "name": "bun-app-updater",
-  "version": "0.1.0",
-  "description": "Support in-app updates for a Bun app, from a release feed: check, download, verify, swap, relaunch.",
+  "version": "0.2.0",
+  "description": "Support in-app updates for a Bun app, from a release feed: check, download the release, verify it, install it, relaunch.",
   "private": true,
   "type": "module",
   "exports": {
@@ -19,9 +19,6 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "bun test ./src/"
-  },
-  "dependencies": {
-    "fflate": "^0.8.3"
   },
   "devDependencies": {
     "@types/bun": "^1.1.14",
