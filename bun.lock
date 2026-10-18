@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "@suite/updater",
+      "name": "bun-app-updater",
       "dependencies": {
         "fflate": "^0.8.3",
       },

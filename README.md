@@ -1,4 +1,4 @@
-# @suite/updater
+# bun-app-updater
 
 In-app updates for a Bun app: check a release feed, download this platform's build,
 verify it, swap it in by rename, relaunch. The app supplies a config and two routes.
@@ -43,7 +43,7 @@ App.app out.zip` (the updater unpacks with ditto and runs `codesign --verify --d
 2. Configure it once, somewhere both the server and the window thread can import:
 
    ```ts
-   import { createUpdater, githubReleases } from "@suite/updater";
+   import { createUpdater, githubReleases } from "bun-app-updater";
    import { version } from "../package.json";
 
    export const updater = createUpdater({
@@ -66,7 +66,7 @@ App.app out.zip` (the updater unpacks with ditto and runs `codesign --verify --d
 3. Two routes on your `Bun.serve`, behind whatever origin check your other routes use:
 
    ```ts
-   import { updateHttp } from "@suite/updater";
+   import { updateHttp } from "bun-app-updater";
    const http = updateHttp(updater);
    // GET  /api/update            -> http.check(req)    JSON UpdateInfo (`?force=1` re-asks the feed)
    // POST /api/update/install    -> http.install(req)  SSE stream of InstallEvent, ending in `done`
@@ -80,7 +80,7 @@ App.app out.zip` (the updater unpacks with ditto and runs `codesign --verify --d
      relaunch,
      waitForArg,
      waitForExit,
-   } from "@suite/updater";
+   } from "bun-app-updater";
    const replacing = waitForArg();
    if (replacing) await waitForExit(replacing); // the copy this one replaces frees the port
    cleanUpAfterUpdate(updater.target()); // Windows: the old exe could not be deleted while it ran
@@ -112,7 +112,7 @@ App.app out.zip` (the updater unpacks with ditto and runs `codesign --verify --d
    the staged install tree:
 
    ```ts
-   import { writeUpdateParts } from "@suite/updater";
+   import { writeUpdateParts } from "bun-app-updater";
    await writeUpdateParts({
      sourceDir: "dist/native",
      outDir: "dist/update",

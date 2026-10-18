@@ -1,5 +1,5 @@
 {
-  "name": "@suite/updater",
+  "name": "bun-app-updater",
   "version": "0.1.0",
   "description": "Support in-app updates for a Bun app, from a release feed: check, download, verify, swap, relaunch.",
   "private": true,
