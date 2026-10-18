@@ -37,9 +37,75 @@ App.app out.zip` (the updater unpacks with ditto and runs `codesign --verify --d
   verified against the manifest's SHA-256s, and against the feed's digests too when it lists
   them.
 
+## Installing it as a submodule
+
+This repo is not published to npm. An app takes it as a **git submodule inside a Bun
+workspace**, so the app compiles this source directly (the `exports` map points at `src/*.ts`;
+there is no build step) and pins the exact commit it was tested against.
+
+1. Add the submodule where your workspace globs will find it. With a root `package.json` of
+
+   ```json
+   { "workspaces": ["app", "packages/*"] }
+   ```
+
+   run, from the repo root:
+
+   ```sh
+   git submodule add -b master https://github.com/dieharders/bun-app-updater.git packages/updater
+   ```
+
+   The folder name does not matter; the package is resolved by its **name**, `bun-app-updater`,
+   whatever the path.
+
+2. Depend on it from the app's `package.json` and install:
+
+   ```json
+   { "dependencies": { "bun-app-updater": "workspace:*" } }
+   ```
+
+   ```sh
+   bun install
+   ```
+
+   Bun links it at `app/node_modules/bun-app-updater` and records it in the lockfile by path.
+   `fflate`, its one dependency, is installed with it.
+
+3. Import it by name, including the subpaths:
+
+   ```ts
+   import { createUpdater, githubReleases } from "bun-app-updater";
+   import { writeUpdateParts } from "bun-app-updater/parts";
+   ```
+
+**Fresh clones and CI** need the submodule checked out before `bun install`, which refuses to run
+with a workspace member missing:
+
+```sh
+git clone --recurse-submodules <your-app>      # or: git submodule update --init --recursive
+```
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    submodules: recursive
+```
+
+**Moving the pin.** The submodule is a commit, not a branch: `git -C packages/updater pull`
+(or `checkout <commit>`), run your app's tests, then commit the new pointer in your repo.
+Consumer-facing shapes — `UpdaterConfig`, `UpdateInfo`, `InstallEvent`, `InstallErrorCode`,
+`WritePartsOptions` and the manifest format — are versioned in `package.json`; a manifest
+format change also bumps `MANIFEST_FORMAT`, and an installed copy refuses a manifest of another
+format with a plain message rather than misreading it. So a format bump ships behind a release
+of the old format that already carries the new reader.
+
+Without a workspace, the same thing works with a path dependency
+(`"bun-app-updater": "file:./vendor/bun-app-updater"`) or by copying the folder in and running
+`bun add fflate`; the submodule is what keeps every app on one source.
+
 ## Dropping it into an app
 
-1. Copy this folder in (as a workspace package, or anywhere) and `bun add fflate`.
+1. Install it as above.
 2. Configure it once, somewhere both the server and the window thread can import:
 
    ```ts
