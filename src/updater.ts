@@ -310,7 +310,15 @@ export function createUpdater(config: UpdaterConfig): Updater {
       onEvent({ type: 'done', ok: true, version: installed })
       return { version: installed }
     } catch (err) {
-      const update = err instanceof UpdateError ? err : new UpdateError(signal?.aborted ? 'cancelled' : 'swap_failed', signal?.aborted ? 'The update was cancelled.' : `The update failed: ${(err as Error).message}`, { cause: err })
+      // Anything not already an UpdateError is unexpected (an fs error, a hook that threw) and its
+      // message is raw: paths inside the install, errno codes. The user gets a sentence; the
+      // original goes in `cause`, which the log line below prints.
+      const update =
+        err instanceof UpdateError
+          ? err
+          : signal?.aborted
+            ? new UpdateError('cancelled', 'The update was cancelled.', { cause: err })
+            : new UpdateError('swap_failed', 'The update failed. Try again, or download the update instead.', { cause: err })
       log(`install failed (${update.code}): ${update.message}${update.cause ? ` — ${String((update.cause as Error).message ?? update.cause)}` : ''}`)
       onEvent({ type: 'done', ok: false, code: update.code, message: update.message })
       throw update

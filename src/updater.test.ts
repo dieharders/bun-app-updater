@@ -217,6 +217,22 @@ describe('install', () => {
     expect(err.code).toBe('busy')
     expect(u.installedVersion()).toBeNull()
   })
+  test('an unexpected failure shows the user a plain message; the raw one goes to the log', async () => {
+    const logged: string[] = []
+    const raw = "EACCES: permission denied, rename '/opt/App/app' -> '/opt/App/.update-old/app'"
+    const u = make({
+      log: (line) => logged.push(line),
+      apply: async () => {
+        throw new Error(raw)
+      },
+    })
+    const { events, onEvent } = collect()
+    const err = await u.install({ onEvent }).catch((e) => e)
+    expect(err.code).toBe('swap_failed')
+    expect(err.message).toBe('The update failed. Try again, or download the update instead.')
+    expect(events.at(-1)).toEqual({ type: 'done', ok: false, code: 'swap_failed', message: err.message })
+    expect(logged.at(-1)).toContain(raw)
+  })
   test('a second install while one runs is refused, and the done event carries failures', async () => {
     let release_: (() => void) | null = null
     const u = make({ apply: () => new Promise<void>((r) => (release_ = r)) })
