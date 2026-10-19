@@ -74,7 +74,9 @@ const make = (over: Partial<UpdaterConfig> = {}) => {
     assetName,
     platform: 'darwin',
     arch: 'arm64',
-    execPath: exe,
+    // Forward slashes, as in makeWindows: a macOS path is split by POSIX rules, which do not
+    // split a Windows host's `\` (and the scratch folder is still writable that way).
+    execPath: exe.replace(/\\/g, '/'),
     downloadDir: path.join(dir, 'downloads'),
     apply: async () => {},
     // Quiet: without a log, failures go to console.warn, and these tests fail installs on purpose.
