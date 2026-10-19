@@ -159,6 +159,13 @@ describe.skipIf(!posix)('resumeStagedInstall', () => {
     // The install it started may fail and bring this version back: that launch runs nothing.
     expect(await resume()).toBe(false)
   })
+  test('a launch with no window runs it without the relaunch: the installer must not open a window nobody asked for', async () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'resume-headless-'))
+    const downloadDir = path.join(dir, 'downloads')
+    const setup = staged(downloadDir, await exitedPid(), '1.1.0')
+    expect(await resumeStagedInstall({ target: { layout: 'directory', path: dir, executable: path.join(dir, 'app') }, appName: 'App', version: '1.0.0', installer: handoff, relaunch: false, downloadDir })).toBe(true)
+    expect(await setup.read()).toBe(`/DIR=${dir} /WAITPID=${process.pid}\n`)
+  })
   test('the newest of several; never one this version already is or is past, a running copy\'s, or with no way to run it', async () => {
     const dir = fs.mkdtempSync(path.join(tmp, 'resume-pick-'))
     const downloadDir = path.join(dir, 'downloads')

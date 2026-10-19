@@ -159,7 +159,9 @@ submodule is what keeps every app on one source.
 
    `resumeStagedInstall` runs only an installer newer than this build, from a copy that has
    exited, and uses up its record as it starts it (as `finishUpdate` does), so an install that
-   fails comes back as the old version offering the update, never as a launch loop.
+   fails comes back as the old version offering the update, never as a launch loop. It tells the
+   installer to start the app again unless `relaunch: false`: pass that from a launch with no
+   window (a `--headless` flag, a script), or the restart opens a window nobody asked for.
 
    `cleanUpAfterUpdate` at launch and nowhere else: it also removes a download folder named for
    this process's own pid, which at launch can only be an earlier process's that had the same

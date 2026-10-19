@@ -215,6 +215,13 @@ export interface ResumeOptions {
   version: string
   /** How to run the installer, as for `finishUpdate`. Without it, nothing is run. */
   installer?: InstallerHandoff
+  /**
+   * Whether the installer should start the app again once it has installed (default true). The
+   * copy that staged it asked for a restart, but THIS launch decides how the app comes back: a
+   * launch with no window (`--headless`, a script) passes false, or the restart would open a
+   * window nobody asked for.
+   */
+  relaunch?: boolean
   downloadDir?: string
   log?: (line: string) => void
 }
@@ -240,7 +247,7 @@ export async function resumeStagedInstall(opts: ResumeOptions): Promise<boolean>
   }
   if (!best) return false
   opts.log?.(`starting the ${best.pending.version} installer an earlier copy staged and never ran`)
-  const args = opts.installer.args({ installDir: opts.target.path, pid: process.pid, relaunch: true })
+  const args = opts.installer.args({ installDir: opts.target.path, pid: process.pid, relaunch: opts.relaunch ?? true })
   if (!(await start(best.pending.file, args, opts.log))) return false
   consumePending(best.dir)
   return true
