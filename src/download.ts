@@ -34,9 +34,11 @@ export interface DownloadOptions {
 export async function downloadTo(url: string, dest: string, opts: DownloadOptions): Promise<void> {
   const fetchFn = opts.fetch ?? fetch
   if (!/^[0-9a-f]{64}$/i.test(opts.sha256 ?? '')) {
-    throw new UpdateError('unverified', `The release feed lists no checksum for ${path.basename(dest)}, so it can't be verified. Download the update instead.`)
+    throw new UpdateError('unverified', "The release feed lists no checksum for the update, so it can't be verified. Download the update instead.", {
+      cause: new Error(`no SHA-256 for ${url}`),
+    })
   }
-  fs.mkdirSync(path.dirname(dest), { recursive: true })
+  onDisk(() => fs.mkdirSync(path.dirname(dest), { recursive: true }))
   const partial = `${dest}.partial`
   const offline = 'The update could not be downloaded. Check your connection and try again.'
 
@@ -58,23 +60,25 @@ export async function downloadTo(url: string, dest: string, opts: DownloadOption
 
     const total = Number(res.headers.get('content-length')) || opts.size
     const hasher = createHash('sha256')
-    fd = fs.openSync(partial, 'w')
+    const out = onDisk(() => fs.openSync(partial, 'w'))
+    fd = out
     let received = 0
     try {
       for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
         hasher.update(chunk)
-        fs.writeSync(fd, chunk)
+        onDisk(() => fs.writeSync(out, chunk))
         received += chunk.byteLength
         opts.onProgress?.(received, total)
       }
     } catch (err) {
+      if (err instanceof UpdateError) throw err
       if (opts.signal?.aborted || isAbort(err)) {
         throw new UpdateError(opts.signal?.aborted ? 'cancelled' : 'offline', opts.signal?.aborted ? 'The update was cancelled.' : offline, { cause: err })
       }
       throw new UpdateError('offline', offline, { cause: err })
     }
-    fs.closeSync(fd)
     fd = null
+    onDisk(() => fs.closeSync(out))
 
     opts.onVerifying?.()
     if (opts.size > 0 && received !== opts.size) {
@@ -84,8 +88,10 @@ export async function downloadTo(url: string, dest: string, opts: DownloadOption
     if (actual !== opts.sha256.toLowerCase()) {
       throw new UpdateError('damaged', "The update's download is damaged (its checksum doesn't match). Try again.")
     }
-    fs.rmSync(dest, { force: true })
-    fs.renameSync(partial, dest)
+    onDisk(() => {
+      fs.rmSync(dest, { force: true })
+      fs.renameSync(partial, dest)
+    })
   } finally {
     if (fd !== null) {
       try {
@@ -94,6 +100,27 @@ export async function downloadTo(url: string, dest: string, opts: DownloadOption
         // Already closed.
       }
     }
-    fs.rmSync(partial, { force: true })
+    try {
+      fs.rmSync(partial, { force: true })
+    } catch {
+      // Held open by a scanner, say; a failure here must not replace the error being thrown.
+    }
+  }
+}
+
+/**
+ * A step on the local disk. Its failure is the disk's (full, read-only, gone), never the
+ * network's, and says so: "check your connection" would send the user after the wrong thing.
+ */
+function onDisk<T>(step: () => T): T {
+  try {
+    return step()
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    const message =
+      code === 'ENOSPC' || code === 'EDQUOT'
+        ? "There isn't enough free disk space to download the update. Free some space and try again."
+        : "The update's download couldn't be saved to disk. Try again, or download the update instead."
+    throw new UpdateError('blocked', message, { cause: err })
   }
 }

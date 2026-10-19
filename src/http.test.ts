@@ -8,17 +8,19 @@ import { type InstallEvent, createUpdater } from './updater'
 
 const make = () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'updater-http-'))
-  fs.writeFileSync(path.join(dir, 'app'), 'old')
+  fs.writeFileSync(path.join(dir, 'app.exe'), 'old')
   let checks = 0
   const updater = createUpdater({
     appName: 'App',
     version: '1.0.0',
     source: { latest: async () => (checks++, { version: '1.1.0', url: 'https://x', assets: [] }) },
-    manifestName: (v, t) => `App-${v}-${t}.manifest.json`,
-    platform: 'linux',
+    assetName: (_v, t) => `App-${t}-setup.exe`,
+    platform: 'win32',
     arch: 'x64',
-    execPath: path.join(dir, 'app'),
+    execPath: path.join(dir, 'app.exe').replace(/\\/g, '/'),
+    installer: { args: () => [] },
     downloadDir: dir,
+    log: () => {},
   })
   return { http: updateHttp(updater), checks: () => checks }
 }

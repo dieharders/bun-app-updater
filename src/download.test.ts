@@ -72,6 +72,20 @@ describe('downloadTo', () => {
     expect(fetched).toBe(0)
     expect(fs.existsSync(dest)).toBe(false)
   })
+  test('a checksum-less download is refused without naming the staging file', async () => {
+    const err = await downloadTo(`${base}/ok`, path.join(tmp, 'app-update-4242-1.1.0.manifest.json'), { size: 1, sha256: '' }).catch((e) => e)
+    expect(err.message).not.toContain('4242')
+    expect(err.cause.message).toContain(`${base}/ok`)
+  })
+  test('a disk that refuses the download is the disk, not the connection', async () => {
+    // A file where the download's folder should be: the first write to disk fails.
+    const notADir = path.join(tmp, 'not-a-dir')
+    fs.writeFileSync(notADir, '')
+    const err = await downloadTo(`${base}/ok`, path.join(notADir, 'x.zip'), { size: body.length, sha256: sha }).catch((e) => e)
+    expect(err.code).toBe('blocked')
+    expect(err.message).toMatch(/saved to disk/)
+    expect(err.message).not.toMatch(/connection/)
+  })
   test('cancelling mid-stream reports cancelled and removes the partial', async () => {
     const dest = path.join(tmp, 'cancel.zip')
     const ac = new AbortController()
