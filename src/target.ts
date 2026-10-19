@@ -34,12 +34,14 @@ export interface TargetOptions {
 export function installTarget(opts: TargetOptions = {}): InstallTarget | null {
   const execPath = opts.execPath ?? process.execPath
   const platform = opts.platform ?? process.platform
-  // By `platform`'s rules, not the host's: POSIX basename does not split on `\`.
+  // By `platform`'s rules, not the host's: POSIX basename does not split on `\`. And by name alone:
+  // `resolve` would make a path absolute against THIS process's working directory, so a macOS
+  // path checked on a Windows host (the tests) came out as `<cwd>/C:/…` and never a bundle.
   const p = platform === 'win32' ? path.win32 : path.posix
   const name = p.basename(execPath)
   if (/^bun(\.exe)?$/i.test(name)) return null
   if (platform === 'darwin') {
-    const app = p.resolve(execPath, '..', '..', '..')
+    const app = p.dirname(p.dirname(p.dirname(execPath)))
     return app.endsWith('.app') ? { layout: 'bundle', path: app, executable: execPath } : null
   }
   return { layout: 'directory', path: p.dirname(execPath), executable: execPath }
