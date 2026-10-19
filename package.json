@@ -1,6 +1,6 @@
 {
   "name": "bun-app-updater",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Support in-app updates for a Bun app, from a release feed: check, download the release, verify it, install it, relaunch.",
   "private": true,
   "type": "module",

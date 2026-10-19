@@ -8,7 +8,7 @@
  * a loopback server in a test, with no branch in the install path.
  */
 import { isAbort } from './errors'
-import { compareVersions, parseVersion } from './version'
+import { parseVersion } from './version'
 
 export interface ReleaseAsset {
   name: string
@@ -59,32 +59,33 @@ export interface GithubReleasesOptions {
   /** `owner/name`. */
   repo: string
   /**
-   * What a tag for THIS app's releases starts with; the version follows it. `v` for a repo that
-   * holds one app's releases, something like `myapp-v` for a repo shared with another stream of
-   * tags. A tag that does not start with it, or whose remainder is not `X.Y.Z`, is not a release
-   * of this app, whatever else is in the repo.
+   * What a tag for THIS app's releases starts with; the version follows it. `v` for tags like
+   * `v1.2.3`, something like `myapp-v` for a repo whose code has tags of its own.
    */
   tagPrefix: string
   /** Sent as the User-Agent, which GitHub requires. Usually the app's name. */
   userAgent: string
-  /** How many of the newest releases to look through for one carrying the prefix. */
-  perPage?: number
   fetch?: Fetch
   timeoutMs?: number
 }
 
 /**
- * GitHub Releases, read through the LIST endpoint rather than `/releases/latest`.
+ * GitHub Releases, read through `/releases/latest`: the release GitHub marks as the repo's
+ * latest, which is never a draft or a prerelease. One request, whatever else the repo holds.
  *
- * `latest` is the newest non-draft, non-prerelease release in the whole repo, whatever its tag
- * says. A repo that also publishes something else — a library beside the app that borrows its
- * public releases page — would then offer that something else as the app's update. Listing and
- * filtering by tag prefix is immune to that, and it is the same one unauthenticated request.
+ * THE REPO'S RELEASES MUST ALL BE THIS APP'S. `latest` is the repo's newest, whatever it is for,
+ * and so are the `releases/latest/download/<name>` links a download page uses. So a release of
+ * something else published there (a library sharing the repo) blocks updates as long as it is
+ * the latest. Its tag will not carry `tagPrefix`, and that is answered as a feed error rather
+ * than as "no release": "no release" would tell every installed copy it is up to date for as
+ * long as that release stayed newest, and nobody would know.
+ *
+ * GitHub's latest, not the highest version: a release published for an older line becomes the
+ * latest unless it is published with "Set as latest" unticked.
  */
 export function githubReleases(opts: GithubReleasesOptions): ReleaseSource {
   const fetchFn = opts.fetch ?? fetch
-  const perPage = opts.perPage ?? 30
-  const url = `https://api.github.com/repos/${opts.repo}/releases?per_page=${perPage}`
+  const url = `https://api.github.com/repos/${opts.repo}/releases/latest`
   const headers = { Accept: 'application/vnd.github+json', 'User-Agent': opts.userAgent }
 
   return {
@@ -96,6 +97,7 @@ export function githubReleases(opts: GithubReleasesOptions): ReleaseSource {
         if (signal?.aborted) throw err
         throw new ReleaseFeedError('The release feed could not be reached. Check your connection and try again.', 'offline')
       }
+      // No published release yet (or no such repo): nothing to offer.
       if (res.status === 404) return null
       if (res.status === 403 || res.status === 429) {
         throw new ReleaseFeedError('GitHub is turning away update requests for now. Try again in an hour.', 'rate_limited')
@@ -104,35 +106,32 @@ export function githubReleases(opts: GithubReleasesOptions): ReleaseSource {
 
       // The body is read under the same signal and timeout as the request, and fails the same
       // ways: a timeout half way is the network; a page that isn't JSON (a captive portal's) is the feed.
-      let list: GithubRelease[]
+      let r: Partial<GithubRelease> | null
       try {
-        list = (await res.json()) as GithubRelease[]
+        r = (await res.json()) as Partial<GithubRelease> | null
       } catch (err) {
         if (signal?.aborted) throw err
         if (isAbort(err)) throw new ReleaseFeedError('The release feed could not be reached. Check your connection and try again.', 'offline')
         throw new ReleaseFeedError('The release feed is not valid JSON.', 'bad_feed')
       }
-      if (!Array.isArray(list)) throw new ReleaseFeedError('The release feed is not in the expected shape.', 'bad_feed')
-
-      let best: Release | null = null
-      for (const r of list) {
-        if (r.draft || r.prerelease || typeof r.tag_name !== 'string') continue
-        if (!r.tag_name.startsWith(opts.tagPrefix)) continue
-        const version = r.tag_name.slice(opts.tagPrefix.length)
-        if (!parseVersion(version)) continue
-        if (best && compareVersions(version, best.version) <= 0) continue
-        best = {
-          version,
-          url: r.html_url,
-          assets: (r.assets ?? []).map((a) => ({
-            name: a.name,
-            url: a.browser_download_url,
-            size: Number(a.size) || 0,
-            sha256: sha256Of(a.digest),
-          })),
-        }
+      if (!r || typeof r !== 'object' || Array.isArray(r) || typeof r.tag_name !== 'string') {
+        throw new ReleaseFeedError('The release feed is not in the expected shape.', 'bad_feed')
       }
-      return best
+
+      const version = r.tag_name.startsWith(opts.tagPrefix) ? r.tag_name.slice(opts.tagPrefix.length) : ''
+      if (!parseVersion(version)) {
+        throw new ReleaseFeedError(`The release feed's newest release (${r.tag_name}) is not one of this app's.`, 'bad_feed')
+      }
+      return {
+        version,
+        url: typeof r.html_url === 'string' ? r.html_url : '',
+        assets: (r.assets ?? []).map((a) => ({
+          name: a.name,
+          url: a.browser_download_url,
+          size: Number(a.size) || 0,
+          sha256: sha256Of(a.digest),
+        })),
+      }
     },
   }
 }
@@ -141,8 +140,6 @@ export function githubReleases(opts: GithubReleasesOptions): ReleaseSource {
 interface GithubRelease {
   tag_name: string
   html_url: string
-  draft?: boolean
-  prerelease?: boolean
   assets?: { name: string; browser_download_url: string; size: number; digest?: string | null }[]
 }
 

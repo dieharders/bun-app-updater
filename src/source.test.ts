@@ -5,13 +5,14 @@ import os from 'node:os'
 import path from 'node:path'
 import { type Fetch, ReleaseFeedError, githubReleases, jsonRelease } from './source'
 
-const gh = (releases: unknown[], status = 200): { fetch: Fetch; urls: string[] } => {
+/** GitHub answering `/releases/latest` with `release` (one release object, as it does). */
+const gh = (release: unknown, status = 200): { fetch: Fetch; urls: string[] } => {
   const urls: string[] = []
   return {
     urls,
     fetch: async (url) => {
       urls.push(url)
-      return new Response(JSON.stringify(releases), { status })
+      return new Response(JSON.stringify(release), { status })
     },
   }
 }
@@ -23,39 +24,40 @@ const rel = (tag: string, assets: string[], extra: Record<string, unknown> = {})
 })
 
 describe('githubReleases', () => {
-  test('lists releases and never asks for /releases/latest', async () => {
-    const { fetch, urls } = gh([rel('motionbuff-v0.13.23', ['MotionBuff-0.13.23-darwin-arm64.zip'])])
+  test('asks for the latest release, in one request', async () => {
+    const { fetch, urls } = gh(rel('motionbuff-v0.13.23', ['MotionBuff-darwin-arm64.dmg']))
     const src = githubReleases({ repo: 'o/r', tagPrefix: 'motionbuff-v', userAgent: 'T', fetch })
     const latest = await src.latest()
-    expect(urls).toHaveLength(1)
-    expect(urls[0]).toContain('/repos/o/r/releases?')
-    expect(urls[0]).not.toContain('/releases/latest')
+    expect(urls).toEqual(['https://api.github.com/repos/o/r/releases/latest'])
     expect(latest).toEqual({
       version: '0.13.23',
       url: 'https://github.com/x/y/releases/tag/motionbuff-v0.13.23',
-      assets: [{ name: 'MotionBuff-0.13.23-darwin-arm64.zip', url: 'https://dl/MotionBuff-0.13.23-darwin-arm64.zip', size: 10, sha256: 'a'.repeat(64) }],
+      assets: [{ name: 'MotionBuff-darwin-arm64.dmg', url: 'https://dl/MotionBuff-darwin-arm64.dmg', size: 10, sha256: 'a'.repeat(64) }],
     })
   })
 
-  test('only this prefix, only published, highest wins whatever the order', async () => {
-    const { fetch } = gh([
-      rel('v9.9.9', ['lib.tgz']), // another stream of tags in the same repo
-      rel('motionbuff-v0.14.0', ['a'], { draft: true }),
-      rel('motionbuff-v0.13.30', ['a'], { prerelease: true }),
-      rel('motionbuff-v0.13.4', ['a']),
-      rel('motionbuff-v0.13.23', ['a']),
-      rel('motionbuff-vnightly', ['a']),
-    ])
-    const src = githubReleases({ repo: 'o/r', tagPrefix: 'motionbuff-v', userAgent: 'T', fetch })
-    expect((await src.latest())?.version).toBe('0.13.23')
+  test("a latest release that is not this app's is a feed error, never \"no release\"", async () => {
+    // "No release" would read as up to date on every installed copy, for as long as the other
+    // release stayed the latest.
+    for (const tag of ['v9.9.9', 'motionbuff-vnightly', 'motionbuff-v1.2']) {
+      const err = await githubReleases({ repo: 'o/r', tagPrefix: 'motionbuff-v', userAgent: 'T', fetch: gh(rel(tag, ['lib.tgz'])).fetch })
+        .latest()
+        .catch((e) => e)
+      expect(err).toBeInstanceOf(ReleaseFeedError)
+      expect(err.code).toBe('bad_feed')
+      expect(err.message).toContain(tag)
+    }
   })
 
   test('nothing published, no digest, and the feed refusing', async () => {
-    expect(await githubReleases({ repo: 'o/r', tagPrefix: 'v', userAgent: 'T', fetch: gh([]).fetch }).latest()).toBeNull()
-    expect(await githubReleases({ repo: 'o/r', tagPrefix: 'v', userAgent: 'T', fetch: gh([], 404).fetch }).latest()).toBeNull()
+    expect(await githubReleases({ repo: 'o/r', tagPrefix: 'v', userAgent: 'T', fetch: gh({ message: 'Not Found' }, 404).fetch }).latest()).toBeNull()
+    for (const shape of [[], null, { name: 'no tag' }]) {
+      const err = await githubReleases({ repo: 'o/r', tagPrefix: 'v', userAgent: 'T', fetch: gh(shape).fetch }).latest().catch((e) => e)
+      expect(err.code).toBe('bad_feed')
+    }
     const noDigest = { ...rel('v1.0.0', ['a']), assets: [{ name: 'a', browser_download_url: 'u', size: 1 }] }
-    expect((await githubReleases({ repo: 'o/r', tagPrefix: 'v', userAgent: 'T', fetch: gh([noDigest]).fetch }).latest())?.assets[0]?.sha256).toBeNull()
-    await expect(githubReleases({ repo: 'o/r', tagPrefix: 'v', userAgent: 'T', fetch: gh([], 403).fetch }).latest()).rejects.toThrow(/turning away/)
+    expect((await githubReleases({ repo: 'o/r', tagPrefix: 'v', userAgent: 'T', fetch: gh(noDigest).fetch }).latest())?.assets[0]?.sha256).toBeNull()
+    await expect(githubReleases({ repo: 'o/r', tagPrefix: 'v', userAgent: 'T', fetch: gh({}, 403).fetch }).latest()).rejects.toThrow(/turning away/)
     const offline: Fetch = async () => {
       throw new TypeError('fetch failed')
     }

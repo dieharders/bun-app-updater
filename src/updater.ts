@@ -51,6 +51,12 @@ export interface UpdaterConfig {
   installer?: InstallerHandoff
   /** Why an install must wait right now (a job running, a child process alive), or null. */
   busy?: () => string | null
+  /**
+   * Why this copy must not install in place, beyond what the updater checks itself (the platform,
+   * the folder, the disk), or null. Unlike `busy`, a reason to offer the download page rather
+   * than to wait: an app run with no window to restart from, say. Asked on every check.
+   */
+  blocked?: () => string | null
   /** How long a check's answer is reused. Default 30 minutes. */
   checkTtlMs?: number
   /** Where the download is staged. Default: the OS temp directory. */
@@ -145,8 +151,14 @@ export function createUpdater(config: UpdaterConfig): Updater {
   const stage = { downloadDir: config.downloadDir }
   // How this install takes an update, or null where it can't in place.
   const strategy: Strategy | null = !target ? null : target.layout === 'bundle' ? 'bundle' : platform === 'win32' && config.installer ? 'installer' : null
-  /** Space the install needs beside the app, as a multiple of the download: a bundle is unpacked beside the old one; an installer writes over it. */
-  const spaceFactor = strategy === 'bundle' ? 4 : 2
+  /**
+   * Space the install needs on the app's volume, as a multiple of the download: the download
+   * itself, and a whole unpacked copy written while the old one is kept to fall back on. A bundle
+   * is unpacked beside the installed one; an installer moves the old version aside (renames, no
+   * space) and writes the new one in full. A compressed release unpacks to two or three times
+   * its download, so 4: under it, the install runs out of space part way and fails every time.
+   */
+  const spaceFactor = 4
 
   let installed: string | null = null
   let installing = false
@@ -168,6 +180,8 @@ export function createUpdater(config: UpdaterConfig): Updater {
     if (target && !strategy) return `${config.appName} can't install updates by itself on ${osName(platform)}. Download the update instead.`
     return blockedReason(target, { platform, appName: config.appName, needBytes })
   }
+  /** The app's own reason, after the updater's: asked every time, it is not cached with them. */
+  const appBlocked = (): string | null => config.blocked?.() ?? null
 
   const describe = (release: Release | null, checkFailed = false): UpdateInfo => {
     const asset = isNewer(release) ? assetFor(release) : null
@@ -179,7 +193,7 @@ export function createUpdater(config: UpdaterConfig): Updater {
       target: targetId,
       latest,
       installed,
-      blocked: blockedCache.reason,
+      blocked: blockedCache.reason ?? appBlocked(),
       checkFailed,
     }
   }
@@ -250,7 +264,7 @@ export function createUpdater(config: UpdaterConfig): Updater {
       owned = true
       const busy = config.busy?.()
       if (busy) fail('busy', `${config.appName} can't update while ${busy}. Try again when it's finished.`)
-      const blocked = whyBlocked()
+      const blocked = whyBlocked() ?? appBlocked()
       if (blocked || !target || !strategy) fail('blocked', blocked ?? `${config.appName} is running from source.`)
 
       onEvent({ type: 'checking' })

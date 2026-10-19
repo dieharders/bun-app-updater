@@ -24,10 +24,10 @@ It has no dependencies.
     app offers the release page instead.
 - The install location is **writable by the user** (per-user installs on Windows, a dragged
   `.app` on macOS). Where it is not, `check()` says why and the app offers a download page.
-- A release feed. Built in: **GitHub Releases** (listed and filtered by tag prefix — never
-  `/releases/latest`, which a repo shared with another project would hijack) and a **JSON
-  release** at any URL (for an app that hosts its own feed, and for testing against a local
-  file).
+- A release feed. Built in: **GitHub Releases** (`/releases/latest`, so **every release in the
+  repo must be the app's**: another project's release published there blocks updates, as a
+  feed error, until an app release is the latest again) and a **JSON release** at any URL (for
+  an app that hosts its own feed, and for testing against a local file).
 - The feed lists a **SHA-256 for the download** (GitHub computes one for every asset). A
   download with no checksum is refused (`unverified`), never installed on trust.
 
@@ -133,6 +133,10 @@ submodule is what keeps every app on one source.
    only happen on an idle app. `installing()` and `installedVersion()` let the app refuse new
    work from the moment an install starts until the restart.
 
+   `blocked()`, optional, is the app's own reason not to install in place at all, beside the
+   updater's (the platform, the folder, the disk): the page then offers the download instead.
+   MotionBuff gives one when it runs with no window, since only the window restarts it.
+
 3. Two routes on your `Bun.serve`, behind whatever origin check your other routes use:
 
    ```ts
@@ -145,15 +149,21 @@ submodule is what keeps every app on one source.
 4. In `main.ts`, before the server starts:
 
    ```ts
-   import { cleanUpAfterUpdate, finishUpdate, installTarget, waitForArg, waitForExit } from "bun-app-updater";
+   import { cleanUpAfterUpdate, finishUpdate, installTarget, resumeStagedInstall, waitForArg, waitForExit } from "bun-app-updater";
    const replacing = waitForArg();
    if (replacing) await waitForExit(replacing); // the copy this one replaces frees the port
+   // An installer a killed copy staged and never ran: run it now, and let it restart the app.
+   if (await resumeStagedInstall({ target: installTarget(), appName: "MyApp", version, installer })) process.exit(0);
    cleanUpAfterUpdate(installTarget(), { appName: "MyApp" }); // what an earlier update left behind
    ```
 
-   At launch and nowhere else: it also removes a download folder named for this process's own
-   pid, which at launch can only be an earlier process's that had the same pid. (The updater's
-   `cleanUp()` does nothing once an install has started.)
+   `resumeStagedInstall` runs only an installer newer than this build, from a copy that has
+   exited, and uses up its record as it starts it (as `finishUpdate` does), so an install that
+   fails comes back as the old version offering the update, never as a launch loop.
+
+   `cleanUpAfterUpdate` at launch and nowhere else: it also removes a download folder named for
+   this process's own pid, which at launch can only be an earlier process's that had the same
+   pid. (The updater's `cleanUp()` does nothing once an install has started.)
 
    and after the window closes — whether the page asked for a restart or the user just closed it:
 
@@ -176,10 +186,12 @@ submodule is what keeps every app on one source.
    for a copy started from a terminal, which `open` would restart with launchd's variables and
    `/` as its folder.
 
-   Every way the app ends has to reach `finishUpdate`, not only a closed window: a run with no
-   window (headless, or a webview that would not open) ends on a signal or on a restart the page
-   asks the server for, and a staged installer that is never started leaves the app refusing
-   work until the next launch throws the download away.
+   Every way the app ends that CAN reach `finishUpdate` should: a run with no window ends on a
+   signal, so wire those to it. A window's thread cannot: it is inside the native event loop
+   until the window closes, and no signal handler runs there. Nor in a Worker: measured on Bun
+   1.4, a Worker's `process.on("SIGINT")` stops the signal killing the process but never runs
+   while the main thread is blocked. A copy killed that way leaves its installer staged, and
+   `resumeStagedInstall` at the next launch runs it.
 
    With webview-bun, ending the loop from a bound callback is `lib.symbols.webview_terminate(webview.unsafeHandle)`
    (`import { lib } from 'webview-bun/src/ffi'`); the class's `destroy()` would free the handle
@@ -206,14 +218,19 @@ The app's installer has to do three things an ordinary install doesn't, and the 
 
 - **Wait for the old process.** `/WAITPID=<pid>` is read in `InitializeSetup` (`OpenProcess` +
   `WaitForSingleObject` from kernel32) so nothing is copied over the running executable.
-- **Start the app again when asked.** A `[Run]` entry with `Check:` on `/RELAUNCH=1`; the
-  ordinary `postinstall skipifsilent` entry does nothing in a silent install.
+- **Start the app again when asked, whether or not the install worked.** A `[Run]` entry with
+  `Check:` on `/RELAUNCH=1`; the ordinary `postinstall skipifsilent` entry does nothing in a
+  silent install. `[Run]` only follows a successful install, so `DeinitializeSetup` starts the
+  previous version itself when it did not: the user pressed Restart, and must not be left with
+  no app.
 - **Remove what the new version no longer ships, without risking the old one.** `[Files]` only
   adds and overwrites, so what the build owns has to go first — but `[InstallDelete]` is not
   undone when the install fails, and an update that dies half way (a shutdown, a full disk, a
   locked file) would leave an app missing its own files. Move them aside instead
   (`CurStepChanged(ssInstall)`), delete the moved copy once the install has finished
-  (`ssPostInstall`), and move it back in `DeinitializeSetup` when it has not.
+  (`ssPostInstall`), and move it back in `DeinitializeSetup` when it has not. The move is all or
+  nothing too: if one item cannot be moved, the ones already moved go back and the install
+  writes over the old version in place, so a moved-aside copy is always a whole one.
 
 `/SILENT` shows the progress window and any error, which is what a user who pressed Restart
 should see; `/VERYSILENT /SUPPRESSMSGBOXES` would turn a failed install into an app that never
@@ -228,7 +245,7 @@ came back.
 | `target`      | `installTarget` (what is replaced), `blockedReason` (why it cannot be), `targetName`                                 |
 | `download`    | stream to a `.partial` file, hash as it goes, verify size and SHA-256 (a missing checksum is refused)                |
 | `swap-bundle` | mount the DMG, ditto the `.app` out, codesign verify, exchange it with the installed one atomically                  |
-| `relaunch`    | `--wait-for=<pid>`, `waitForExit`, `relaunch` (`open -n` on macOS), `finishUpdate`, `cleanUpAfterUpdate`             |
+| `relaunch`    | `--wait-for=<pid>`, `waitForExit`, `relaunch` (`open -n` on macOS), `finishUpdate`, `resumeStagedInstall`, `cleanUpAfterUpdate` |
 | `feed`        | `writeLocalFeed`: a `release.json` of `file:` URLs over a build's downloads, for rehearsing an update                 |
 | `updater`     | the facade: check cache, single-flight install, `installedVersion`, events                                           |
 | `http`        | the two routes, for any `Bun.serve`                                                                                  |

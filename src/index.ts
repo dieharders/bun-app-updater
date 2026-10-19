@@ -11,6 +11,7 @@ export {
   isAlive,
   pendingInstaller,
   relaunch,
+  resumeStagedInstall,
   stageDir,
   waitForArg,
   waitForExit,
@@ -18,6 +19,7 @@ export {
   type FinishOptions,
   type InstallerHandoff,
   type PendingInstaller,
+  type ResumeOptions,
 } from './relaunch'
 export { createUpdater, type InstallEvent, type InstallEventSink, type UpdateInfo, type Updater, type UpdaterConfig } from './updater'
 export { updateHttp, SSE_HEADERS, type UpdateHttp } from './http'

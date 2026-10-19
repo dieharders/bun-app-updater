@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { pendingInstaller } from './relaunch'
 import { type Release, type ReleaseAsset, ReleaseFeedError, type ReleaseSource, staticRelease } from './source'
+import { freeBytes } from './target'
 import { type InstallEvent, type UpdaterConfig, createUpdater } from './updater'
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'updater-facade-'))
@@ -123,6 +124,22 @@ describe('check', () => {
     const info = await make({ source: staticRelease(release('1.1.0', { size: Number.MAX_SAFE_INTEGER / 8 })) }).check()
     expect(info.latest?.version).toBe('1.1.0')
     expect(info.blocked).toMatch(/disk space/)
+  })
+  test('an installer needs room for its download and the whole new copy beside the old one, not twice the download', async () => {
+    // A third of the free space: twice it fits, and the ~3.5x an installer really writes does not.
+    const probe = makeWindows()
+    const free = freeBytes(path.dirname(probe.target()!.path))!
+    const info = await makeWindows({ source: staticRelease(release('1.1.0', { size: Math.floor(free / 3) })) }).check()
+    expect(info.blocked).toMatch(/disk space/)
+  })
+  test("the app's own reason blocks it too, and is asked on every check, not cached with the feed's answer", async () => {
+    let reason: string | null = 'App installs updates from its window.'
+    const u = make({ blocked: () => reason })
+    expect((await u.check()).blocked).toBe('App installs updates from its window.')
+    reason = null
+    expect((await u.check()).blocked).toBeNull()
+    // The updater's own reasons come first: from source says more than "no window".
+    expect((await make({ execPath: '/usr/local/bin/bun', blocked: () => 'no window' }).check()).blocked).toMatch(/from source/)
   })
   test('asks the feed once per TTL however often the page asks; force asks again after the floor', async () => {
     let calls = 0
@@ -271,6 +288,7 @@ describe('install', () => {
   test('refuses while busy, from source, on Linux, with no update, and too big for the disk', async () => {
     expect(await code(make({ busy: () => 'a video is being made' }))).toBe('busy')
     expect(await code(make({ execPath: '/usr/local/bin/bun' }))).toBe('blocked')
+    expect(await code(make({ blocked: () => 'App installs updates from its window.' }))).toBe('blocked')
     const dir = fs.mkdtempSync(path.join(tmp, 'linux-'))
     expect(await code(make({ platform: 'linux', arch: 'x64', execPath: path.join(dir, 'app') }))).toBe('blocked')
     expect(await code(make({ source: staticRelease(release('1.0.0')) }))).toBe('no_update')

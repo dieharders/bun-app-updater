@@ -12,7 +12,9 @@
  *   Windows  nothing has been replaced yet. The verified installer was staged by install(), and
  *            the old process starts it as it exits; the app's `InstallerHandoff` tells it to
  *            wait for this pid, install over the app unattended, and start it again. The
- *            installer waits, so the port is free the same way.
+ *            installer waits, so the port is free the same way. A copy that ends without
+ *            getting here (killed, crashed) leaves the installer staged, and the next launch
+ *            runs it (`resumeStagedInstall`).
  *
  * `finishUpdate` is the one call that does whichever applies; the app awaits it after its window
  * closes, whether the user asked for the restart or just closed the app.
@@ -23,6 +25,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { STAGING_PID, stagingFor } from './swap-bundle'
 import type { InstallTarget } from './target'
+import { compareVersions, parseVersion } from './version'
 
 export const WAIT_FOR_FLAG = '--wait-for='
 
@@ -164,12 +167,83 @@ export function writePendingInstaller(dir: string, pending: PendingInstaller): v
 
 /** The installer this process staged, or null. */
 export function pendingInstaller(appName: string, opts: { pid?: number; downloadDir?: string } = {}): PendingInstaller | null {
+  return readPending(stageDir(appName, opts))
+}
+
+function readPending(dir: string): PendingInstaller | null {
   try {
-    const raw = JSON.parse(fs.readFileSync(path.join(stageDir(appName, opts), PENDING), 'utf8')) as Partial<PendingInstaller>
+    const raw = JSON.parse(fs.readFileSync(path.join(dir, PENDING), 'utf8')) as Partial<PendingInstaller>
     return typeof raw.version === 'string' && typeof raw.file === 'string' && fs.existsSync(raw.file) ? { version: raw.version, file: raw.file } : null
   } catch {
     return null
   }
+}
+
+/**
+ * Forget a staged installer once it has started: whatever becomes of the install, it is never
+ * run again from this record. An install that fails then comes back as the old version offering
+ * the update, rather than as a launch that runs the same failing installer again.
+ */
+function consumePending(dir: string): void {
+  try {
+    fs.rmSync(path.join(dir, PENDING), { force: true })
+  } catch {
+    // Still held: the installer's own wait for this process outlasts it either way.
+  }
+}
+
+/** The stage folders of copies that have exited, with the pid each was named for. */
+function exitedStages(appName: string, downloadDir?: string): { dir: string; pid: number }[] {
+  const dir = downloadDir ?? os.tmpdir()
+  const prefix = stagePrefix(appName)
+  let names: string[] = []
+  try {
+    names = fs.readdirSync(dir).filter((n) => n.startsWith(prefix))
+  } catch {
+    // No temp directory to read: nothing staged there.
+  }
+  return names
+    .map((name) => ({ dir: path.join(dir, name), pid: Number(name.slice(prefix.length)) }))
+    .filter(({ pid }) => Number.isInteger(pid) && pid > 0 && (pid === process.pid || !isAlive(pid)))
+}
+
+export interface ResumeOptions {
+  /** The running app's install (`installTarget()`); null when running from source. */
+  target: InstallTarget | null
+  appName: string
+  /** The running build's version: only a newer staged installer is run. */
+  version: string
+  /** How to run the installer, as for `finishUpdate`. Without it, nothing is run. */
+  installer?: InstallerHandoff
+  downloadDir?: string
+  log?: (line: string) => void
+}
+
+/**
+ * Run an installer an earlier copy staged and never ran, because it ended some way that never
+ * reached `finishUpdate`: killed, crashed, or a signal while its window thread was inside the
+ * native event loop, where no handler can run. Call at launch, after `waitForExit` and before
+ * `cleanUpAfterUpdate`, which would otherwise throw the download away and offer the same update
+ * again. Resolves true once the installer has started, and the app should then EXIT: the
+ * installer waits for this process, installs, and starts the app again. False: carry on.
+ *
+ * Only a version newer than this one, staged by a process that has exited; the newest, where
+ * there are several. The user asked for it, and an app that quits normally runs it the same way.
+ */
+export async function resumeStagedInstall(opts: ResumeOptions): Promise<boolean> {
+  if (!opts.target || !opts.installer) return false
+  let best: { dir: string; pending: PendingInstaller } | null = null
+  for (const { dir } of exitedStages(opts.appName, opts.downloadDir)) {
+    const pending = readPending(dir)
+    if (!pending || !parseVersion(pending.version) || compareVersions(pending.version, opts.version) <= 0) continue
+    if (!best || compareVersions(pending.version, best.pending.version) > 0) best = { dir, pending }
+  }
+  if (!best) return false
+  opts.log?.(`starting the ${best.pending.version} installer an earlier copy staged and never ran`)
+  const args = opts.installer.args({ installDir: opts.target.path, pid: process.pid, relaunch: true })
+  if (!(await start(best.pending.file, args, opts.log))) return false
+  consumePending(best.dir)
+  return true
 }
 
 export interface FinishOptions {
@@ -196,16 +270,18 @@ export interface FinishOptions {
  * A staged installer (Windows) runs whether or not the user asked for the restart: an update
  * the user started finishes when they close the app, and only the relaunch depends on the ask.
  * If the installer cannot be started, the app is started again as it is (nothing was replaced),
- * so a Restart never ends with no app. Otherwise, on a restart, the new copy is started.
+ * so a Restart never ends with no app. Otherwise, on a restart, the new copy is started. Once
+ * the installer has started, its staged record is used up (see `consumePending`).
  */
 export async function finishUpdate(opts: FinishOptions): Promise<void> {
   const { target, log } = opts
   if (!target) return
-  const pending = opts.installer ? pendingInstaller(opts.appName, { downloadDir: opts.downloadDir }) : null
+  const stage = stageDir(opts.appName, { downloadDir: opts.downloadDir })
+  const pending = opts.installer ? readPending(stage) : null
   if (pending && opts.installer) {
     const args = opts.installer.args({ installDir: target.path, pid: process.pid, relaunch: opts.relaunch })
     log?.(`starting the ${pending.version} installer`)
-    if (await start(pending.file, args, log)) return
+    if (await start(pending.file, args, log)) return consumePending(stage)
   }
   if (opts.relaunch) await relaunch(target, { platform: opts.platform, log, args: opts.args, env: opts.env })
 }
@@ -236,20 +312,7 @@ export function cleanUpAfterUpdate(target: InstallTarget | null, opts: CleanUpOp
     const staging = stagingFor(target.path)
     if (!ownedByOtherLiveProcess(staging)) leftovers.push(staging)
   }
-  if (opts.appName) {
-    const dir = opts.downloadDir ?? os.tmpdir()
-    const prefix = stagePrefix(opts.appName)
-    let names: string[] = []
-    try {
-      names = fs.readdirSync(dir).filter((n) => n.startsWith(prefix))
-    } catch {
-      // No temp directory to read: nothing staged there.
-    }
-    for (const name of names) {
-      const pid = Number(name.slice(prefix.length))
-      if (Number.isInteger(pid) && pid > 0 && (pid === process.pid || !isAlive(pid))) leftovers.push(path.join(dir, name))
-    }
-  }
+  if (opts.appName) for (const { dir } of exitedStages(opts.appName, opts.downloadDir)) leftovers.push(dir)
   for (const p of leftovers) {
     try {
       fs.rmSync(p, { recursive: true, force: true })

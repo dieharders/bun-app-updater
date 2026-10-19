@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from 'bun:test'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { cleanUpAfterUpdate, finishUpdate, isAlive, pendingInstaller, relaunch, stageDir, waitForArg, waitForExit, writePendingInstaller } from './relaunch'
+import { cleanUpAfterUpdate, finishUpdate, isAlive, pendingInstaller, relaunch, resumeStagedInstall, stageDir, waitForArg, waitForExit, writePendingInstaller } from './relaunch'
 import { STAGING_PID } from './swap-bundle'
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'updater-relaunch-'))
@@ -86,6 +86,9 @@ describe.skipIf(!posix)('finishUpdate', () => {
       await finishUpdate({ target: { layout: 'directory', path: dir, executable: app.exe }, appName: 'App', relaunch: ask, installer: handoff, downloadDir, platform: 'linux' })
       expect(await setup.read()).toBe(`/SILENT /DIR=${dir} /WAITPID=${process.pid}${ask ? ' /RELAUNCH=1' : ''}\n`)
       expect(await app.read()).toBeNull()
+      // Used up: an install that fails and starts the old version again does not run it again.
+      expect(pendingInstaller('App', { downloadDir })).toBeNull()
+      expect(await resumeStagedInstall({ target: { layout: 'directory', path: dir, executable: app.exe }, appName: 'App', version: '1.0.0', installer: handoff, downloadDir })).toBe(false)
     }
   })
   test('an installer that cannot start falls back to starting the app as it is, on a restart', async () => {
@@ -127,6 +130,59 @@ describe.skipIf(!posix)('finishUpdate', () => {
     await finishUpdate({ target, appName: 'App', relaunch: false, installer: handoff, downloadDir, platform: 'linux' })
     expect(await setup.read()).toBeNull()
     expect(await app.read()).toBeNull()
+  })
+})
+
+describe.skipIf(!posix)('resumeStagedInstall', () => {
+  const handoff = { args: ({ installDir, pid, relaunch }: { installDir: string; pid: number; relaunch: boolean }) => [`/DIR=${installDir}`, `/WAITPID=${pid}`, ...(relaunch ? ['/RELAUNCH=1'] : [])] }
+  /** A pid that was running a moment ago and is not now. */
+  const exitedPid = async () => {
+    const gone = Bun.spawn([process.execPath, '-e', '0'])
+    await gone.exited
+    return gone.pid
+  }
+  const staged = (downloadDir: string, pid: number, version: string) => {
+    const stage = stageDir('App', { pid, downloadDir })
+    fs.mkdirSync(stage, { recursive: true })
+    const setup = recorder(stage, 'setup')
+    writePendingInstaller(stage, { version, file: setup.exe })
+    return setup
+  }
+
+  test('runs, once, the installer a copy that was killed staged and never ran, told to wait for this one and relaunch', async () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'resume-'))
+    const downloadDir = path.join(dir, 'downloads')
+    const setup = staged(downloadDir, await exitedPid(), '1.1.0')
+    const resume = () => resumeStagedInstall({ target: { layout: 'directory', path: dir, executable: path.join(dir, 'app') }, appName: 'App', version: '1.0.0', installer: handoff, downloadDir })
+    expect(await resume()).toBe(true)
+    expect(await setup.read()).toBe(`/DIR=${dir} /WAITPID=${process.pid} /RELAUNCH=1\n`)
+    // The install it started may fail and bring this version back: that launch runs nothing.
+    expect(await resume()).toBe(false)
+  })
+  test('the newest of several; never one this version already is or is past, a running copy\'s, or with no way to run it', async () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'resume-pick-'))
+    const downloadDir = path.join(dir, 'downloads')
+    const target = { layout: 'directory' as const, path: dir, executable: path.join(dir, 'app') }
+    const older = staged(downloadDir, await exitedPid(), '1.1.0')
+    const newer = staged(downloadDir, await exitedPid(), '1.2.0')
+    expect(await resumeStagedInstall({ target, appName: 'App', version: '1.0.0', installer: handoff, downloadDir })).toBe(true)
+    expect(await newer.read()).not.toBeNull()
+    expect(await older.read()).toBeNull()
+
+    const quiet = fs.mkdtempSync(path.join(tmp, 'resume-none-'))
+    const quietDl = path.join(quiet, 'downloads')
+    staged(quietDl, await exitedPid(), '1.0.0')
+    const other = Bun.spawn([process.execPath, '-e', 'await Bun.sleep(5000)'])
+    try {
+      staged(quietDl, other.pid, '2.0.0')
+      expect(await resumeStagedInstall({ target, appName: 'App', version: '1.0.0', installer: handoff, downloadDir: quietDl })).toBe(false)
+    } finally {
+      other.kill()
+      await other.exited
+    }
+    staged(quietDl, await exitedPid(), '1.5.0')
+    expect(await resumeStagedInstall({ target, appName: 'App', version: '1.0.0', downloadDir: quietDl })).toBe(false)
+    expect(await resumeStagedInstall({ target: null, appName: 'App', version: '1.0.0', installer: handoff, downloadDir: quietDl })).toBe(false)
   })
 })
 
