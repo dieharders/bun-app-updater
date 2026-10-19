@@ -72,12 +72,19 @@ export interface UpdateInfo {
   installed: string | null
   /** Why an in-place install is impossible here, so the UI offers the download page; null when it can. */
   blocked: string | null
+  /**
+   * The last ask of the feed failed (offline, the feed down, rate-limited): `latest` is null for
+   * want of an answer, not because there is no update. A page asks again sooner than it would
+   * after an answer — the cached failure is asked again after a minute.
+   */
+  checkFailed: boolean
 }
 
 export type InstallEvent =
   | { type: 'checking' }
   | { type: 'downloading'; received: number; total: number }
   | { type: 'verifying' }
+  /** `total` 0: how far the step has got is not known (the macOS unpack reports none), so show it as indeterminate. */
   | { type: 'unpacking'; done: number; total: number }
   | { type: 'swapping' }
   | { type: 'done'; ok: true; version: string }
@@ -99,13 +106,23 @@ export interface Updater {
    * stay `() => {}`.
    */
   relaunch(): Promise<void> | void
-  /** Remove a previous update's leftovers; call at launch. */
+  /**
+   * Remove a previous update's leftovers; call at launch. Does nothing once an install has
+   * started, since by then this process's own download folder holds what the quit runs.
+   */
   cleanUp(): void
   /** The release the last check found, newer or not. */
   lastRelease(): Release | null
 }
 
 type Strategy = 'bundle' | 'installer'
+
+/** One ask of the feed, shared by every check until it goes stale. `failed` is set before `release` settles. */
+interface CheckEntry {
+  at: number
+  release: Promise<Release | null>
+  failed: boolean
+}
 
 const DEFAULT_TTL = 30 * 60_000
 /**
@@ -133,8 +150,13 @@ export function createUpdater(config: UpdaterConfig): Updater {
 
   let installed: string | null = null
   let installing = false
-  let lastCheck: { at: number; release: Promise<Release | null>; failed: boolean } | null = null
+  let lastCheck: CheckEntry | null = null
   let lastRelease: Release | null = null
+  // What the last check said about installing in place. Working it out writes a probe file into
+  // the install folder and stats its volume (blockedReason), and a page polls; on Windows every
+  // probe is also a Defender scan. So it is worked out again only when the feed is asked again,
+  // or the download it is sized for changes. install() always asks afresh.
+  let blockedCache: { needBytes: number; reason: string | null } | null = null
 
   const assetFor = (release: Release): ReleaseAsset | null => {
     const name = config.assetName(release.version, targetId)
@@ -147,15 +169,18 @@ export function createUpdater(config: UpdaterConfig): Updater {
     return blockedReason(target, { platform, appName: config.appName, needBytes })
   }
 
-  const describe = (release: Release | null): UpdateInfo => {
+  const describe = (release: Release | null, checkFailed = false): UpdateInfo => {
     const asset = isNewer(release) ? assetFor(release) : null
     const latest = release && asset ? { version: release.version, url: release.url, size: asset.size } : null
+    const needBytes = latest ? latest.size * spaceFactor : 0
+    if (blockedCache?.needBytes !== needBytes) blockedCache = { needBytes, reason: whyBlocked(needBytes) }
     return {
       current: config.version,
       target: targetId,
       latest,
       installed,
-      blocked: whyBlocked(latest ? latest.size * spaceFactor : 0),
+      blocked: blockedCache.reason,
+      checkFailed,
     }
   }
 
@@ -180,12 +205,22 @@ export function createUpdater(config: UpdaterConfig): Updater {
       // The answer is cached for every page that asks, so the fetch runs under none of their
       // signals: one page reloading mid-check would otherwise cache "no update" for the TTL.
       const release = fetchRelease()
-      const entry = { at: Date.now(), release: release.catch(() => null), failed: false }
-      release.catch((err) => {
-        entry.failed = true
-        warn(`check failed: ${errorText(err)}`)
-      })
+      const entry: CheckEntry = {
+        at: Date.now(),
+        // One handler, so `failed` is set before anyone awaiting the answer reads it.
+        release: release.then(
+          (found) => found,
+          (err) => {
+            entry.failed = true
+            warn(`check failed: ${errorText(err)}`)
+            return null
+          },
+        ),
+        failed: false,
+      }
       lastCheck = entry
+      // Asked again with the feed: the disk may have been cleared, or the folder made writable.
+      blockedCache = null
       if (opts.force) {
         try {
           await untilAborted(release, opts.signal)
@@ -196,7 +231,9 @@ export function createUpdater(config: UpdaterConfig): Updater {
         }
       }
     }
-    return describe(await untilAborted(lastCheck!.release, opts.signal))
+    const entry = lastCheck!
+    const release = await untilAborted(entry.release, opts.signal)
+    return describe(release, entry.failed)
   }
 
   const install: Updater['install'] = async ({ onEvent, signal }) => {
@@ -249,7 +286,9 @@ export function createUpdater(config: UpdaterConfig): Updater {
       if (busyNow) fail('busy', `${config.appName} can't update while ${busyNow}. Try again when it's finished.`)
 
       if (strategy === 'bundle') {
-        onEvent({ type: 'unpacking', done: 0, total: 1 })
+        // Total 0, not 1: the copy and the signature check report no progress, and `done: 0 of 1`
+        // drew an empty bar for the minute they take, as if the update had stalled.
+        onEvent({ type: 'unpacking', done: 0, total: 0 })
         await (config.apply ?? defaultApply)(file, target!, onEvent, signal)
       } else {
         // Windows: nothing is replaced while the app runs. The installer runs as it quits (relaunch()).
@@ -306,7 +345,10 @@ export function createUpdater(config: UpdaterConfig): Updater {
     installing: () => installing,
     target: () => target,
     relaunch: () => finishUpdate({ target, appName: config.appName, relaunch: true, installer: config.installer, downloadDir: config.downloadDir, platform, log: warn }),
-    cleanUp: () => cleanUpAfterUpdate(target, { appName: config.appName, downloadDir: config.downloadDir }),
+    cleanUp: () => {
+      if (installing || installed) return
+      cleanUpAfterUpdate(target, { appName: config.appName, downloadDir: config.downloadDir })
+    },
     lastRelease: () => lastRelease,
   }
 }

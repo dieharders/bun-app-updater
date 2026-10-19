@@ -1,5 +1,5 @@
 /** The facade: what a check answers, how often it asks, and the install path with the swap stubbed. */
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
+import { afterAll, beforeAll, describe, expect, spyOn, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -100,7 +100,7 @@ const makeWindows = (over: Partial<UpdaterConfig> = {}) => {
 describe('check', () => {
   test('a newer release with a download for this target is offered, with that download\'s size', async () => {
     const info = await make().check()
-    expect(info).toEqual({ current: '1.0.0', target: 'darwin-arm64', latest: { version: '1.1.0', url: 'https://x/1.1.0', size: served.get('App-darwin-arm64.dmg')!.length }, installed: null, blocked: null })
+    expect(info).toEqual({ current: '1.0.0', target: 'darwin-arm64', latest: { version: '1.1.0', url: 'https://x/1.1.0', size: served.get('App-darwin-arm64.dmg')!.length }, installed: null, blocked: null, checkFailed: false })
   })
   test('not newer, not this target, nothing published', async () => {
     expect((await make({ source: staticRelease(release('1.0.0')) }).check()).latest).toBeNull()
@@ -143,17 +143,42 @@ describe('check', () => {
       },
     }
     const u = make({ source })
-    expect((await u.check()).latest).toBeNull()
-    expect((await u.check()).latest).toBeNull() // inside the floor: the failure stands
+    // Said as a failure, not as "no update": a page asks again sooner for it.
+    expect(await u.check()).toMatchObject({ latest: null, checkFailed: true })
+    expect(await u.check()).toMatchObject({ latest: null, checkFailed: true }) // inside the floor: the failure stands
     expect(calls).toBe(1)
     const now = Date.now
     Date.now = () => now() + 61_000
     try {
-      expect((await u.check()).latest?.version).toBe('1.1.0')
+      expect(await u.check()).toMatchObject({ latest: { version: '1.1.0' }, checkFailed: false })
     } finally {
       Date.now = now
     }
     expect(calls).toBe(2)
+  })
+  test('the write probe runs once per ask of the feed, not on every check a page makes', async () => {
+    const written: string[] = []
+    const probes = () => written.filter((p) => p.includes('-write-test-')).length
+    const real = fs.writeFileSync
+    const counting = spyOn(fs, 'writeFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      written.push(String(file))
+      return (real as (...a: unknown[]) => void)(file, ...rest)
+    }) as typeof fs.writeFileSync)
+    try {
+      const u = make()
+      for (let i = 0; i < 5; i++) await u.check()
+      expect(probes()).toBe(1)
+      const now = Date.now
+      Date.now = () => now() + 61_000
+      try {
+        await u.check({ force: true }) // the feed asked again: so is the folder
+      } finally {
+        Date.now = now
+      }
+      expect(probes()).toBe(2)
+    } finally {
+      counting.mockRestore()
+    }
   })
   test('a failed background check offers nothing; a failed forced check says why, in the feed\'s words only', async () => {
     const logged: string[] = []
@@ -218,6 +243,8 @@ describe('install', () => {
     const { events, onEvent } = collect()
     expect(await u.install({ onEvent })).toEqual({ version: '1.1.0' })
     expect(events.map((e) => e.type)).toEqual(['checking', 'downloading', 'downloading', 'verifying', 'unpacking', 'swapping', 'done'])
+    // Indeterminate: the unpack reports no progress, and `0 of 1` drew an empty bar.
+    expect(events.find((e) => e.type === 'unpacking')).toEqual({ type: 'unpacking', done: 0, total: 0 })
     expect(events.at(-1)).toEqual({ type: 'done', ok: true, version: '1.1.0' })
     expect(applied!).toMatchObject({ bytes: 'App-darwin-arm64.dmg 1.1.0', layout: 'bundle' })
     expect(fs.existsSync(path.dirname(applied!.file))).toBe(false) // the download and its folder are gone
@@ -237,6 +264,9 @@ describe('install', () => {
     expect(pending?.version).toBe('1.1.0')
     expect(fs.readFileSync(pending!.file, 'utf8')).toBe('App-windows-x64-setup.exe 1.1.0')
     expect(u.installedVersion()).toBe('1.1.0')
+    // A cleanUp() after the install leaves the staged installer for the quit.
+    u.cleanUp()
+    expect(pendingInstaller('App', { downloadDir })?.version).toBe('1.1.0')
   })
   test('refuses while busy, from source, on Linux, with no update, and too big for the disk', async () => {
     expect(await code(make({ busy: () => 'a video is being made' }))).toBe('busy')

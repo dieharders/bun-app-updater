@@ -57,6 +57,17 @@ describe.skipIf(process.platform !== 'darwin')('relaunch, macOS', () => {
     expect(logged).toEqual([`open exited with 1; starting ${exe} directly`])
     expect(await read()).toBe('--wait-for=4242\n')
   })
+  test('with an environment, the executable is started directly with it, in this working directory — not through open', async () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'open-env-'))
+    const marker = path.join(dir, 'started')
+    const exe = path.join(dir, 'tiny')
+    fs.writeFileSync(exe, `#!/bin/sh\necho "$MARK $(pwd) $@" >> '${marker}'\n`, { mode: 0o755 })
+    const logged: string[] = []
+    await relaunch({ layout: 'bundle', path: path.join(dir, 'Missing.app'), executable: exe }, { pid: 4242, env: { ...process.env, MARK: 'from-the-terminal' }, log: (l) => logged.push(l) })
+    for (let i = 0; i < 50 && !fs.existsSync(marker); i++) await Bun.sleep(20)
+    expect(logged).toEqual([]) // `open` was never tried
+    expect(fs.readFileSync(marker, 'utf8')).toBe(`from-the-terminal ${fs.realpathSync(process.cwd())} --wait-for=4242\n`)
+  })
 })
 
 describe.skipIf(!posix)('finishUpdate', () => {
@@ -91,14 +102,31 @@ describe.skipIf(!posix)('finishUpdate', () => {
     expect(logged.some((l) => l.startsWith(`could not start ${setup}`))).toBe(true)
     expect(await app.read()).toBe(`--wait-for=${process.pid}\n`)
   })
-  test('with nothing staged: a restart starts the app, a close does nothing', async () => {
+  test('with nothing staged: a restart starts the app, with its arguments; a close does nothing', async () => {
     const dir = fs.mkdtempSync(path.join(tmp, 'finish-none-'))
     const app = recorder(dir, 'app')
     const target = { layout: 'directory' as const, path: dir, executable: app.exe }
     await finishUpdate({ target, appName: 'App', relaunch: false, installer: handoff, downloadDir: path.join(dir, 'dl'), platform: 'linux' })
     expect(await app.read()).toBeNull()
-    await finishUpdate({ target, appName: 'App', relaunch: true, installer: handoff, downloadDir: path.join(dir, 'dl'), platform: 'linux' })
-    expect(await app.read()).toBe(`--wait-for=${process.pid}\n`)
+    await finishUpdate({ target, appName: 'App', relaunch: true, installer: handoff, downloadDir: path.join(dir, 'dl'), platform: 'linux', args: ['--headless'] })
+    expect(await app.read()).toBe(`--wait-for=${process.pid} --headless\n`)
+  })
+  test('an installer an earlier process left under this pid is removed at launch, so the quit runs nothing', async () => {
+    // The OS recycles pids: a crash with an update staged, a reboot that kept TEMP, and a later
+    // launch can be given the same one. That folder's installer is a version nobody asked for now.
+    const dir = fs.mkdtempSync(path.join(tmp, 'finish-stale-'))
+    const downloadDir = path.join(dir, 'downloads')
+    const app = recorder(dir, 'app')
+    const stage = stageDir('App', { downloadDir })
+    fs.mkdirSync(stage, { recursive: true })
+    const setup = recorder(stage, 'setup')
+    writePendingInstaller(stage, { version: '1.1.0', file: setup.exe })
+    const target = { layout: 'directory' as const, path: dir, executable: app.exe }
+    cleanUpAfterUpdate(target, { appName: 'App', downloadDir })
+    expect(fs.existsSync(stage)).toBe(false)
+    await finishUpdate({ target, appName: 'App', relaunch: false, installer: handoff, downloadDir, platform: 'linux' })
+    expect(await setup.read()).toBeNull()
+    expect(await app.read()).toBeNull()
   })
 })
 
@@ -113,7 +141,7 @@ describe('cleanUpAfterUpdate', () => {
     cleanUpAfterUpdate({ layout: 'bundle', path: app, executable: '' })
     cleanUpAfterUpdate(null)
   })
-  test('leaves alone what another running copy is in the middle of', async () => {
+  test('leaves alone what another running copy is in the middle of, and not what an earlier holder of this pid left', async () => {
     const dir = fs.mkdtempSync(path.join(tmp, 'clean-live-'))
     const app = path.join(dir, 'App.app')
     fs.mkdirSync(`${app}.new`, { recursive: true })
@@ -124,7 +152,7 @@ describe('cleanUpAfterUpdate', () => {
       for (const pid of [other.pid, process.pid]) fs.mkdirSync(stageDir('App', { pid, downloadDir }), { recursive: true })
       cleanUpAfterUpdate({ layout: 'bundle', path: app, executable: '' }, { appName: 'App', downloadDir })
       expect(fs.existsSync(`${app}.new`)).toBe(true)
-      expect(fs.readdirSync(downloadDir).sort()).toEqual([`app-update-${other.pid}`, `app-update-${process.pid}`].sort())
+      expect(fs.readdirSync(downloadDir)).toEqual([`app-update-${other.pid}`])
     } finally {
       other.kill()
       await other.exited

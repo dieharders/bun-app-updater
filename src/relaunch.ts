@@ -58,6 +58,16 @@ export interface RelaunchOptions {
   log?: (line: string) => void
   /** macOS: how long to wait for `open` to answer before taking it as having worked. */
   openTimeoutMs?: number
+  /**
+   * The new copy's environment. On macOS, giving one starts the executable directly, in this
+   * process's working directory, rather than through `open -n` — which starts the copy with
+   * launchd's environment and `/` as its working directory. That is right for an app opened from
+   * Finder or the Dock, whose environment is launchd's anyway; a copy started from a terminal
+   * would lose that terminal's variables (and a `.env` read from its folder) across the restart.
+   * Elsewhere the executable is always started directly, and inherits this process's environment
+   * unless one is given.
+   */
+  env?: NodeJS.ProcessEnv
 }
 
 /**
@@ -66,7 +76,8 @@ export interface RelaunchOptions {
  * macOS goes through `open -n`: a fresh instance even while this one is still running, started
  * as an app (owned by launchd, responsible for its own permission prompts) rather than as a
  * child of a process that is about to exit. `--args` hands the flag through. If `open` cannot
- * (a stale Launch Services record after the swap), the executable is spawned directly.
+ * (a stale Launch Services record after the swap), the executable is spawned directly. With
+ * `env`, it is spawned directly from the start (see `RelaunchOptions.env`).
  *
  * AWAIT IT BEFORE EXITING. Whether `open` worked is only known when it exits, and a process that
  * quits first never finds out, so the fallback never runs. The promise settles once the new copy
@@ -76,8 +87,8 @@ export interface RelaunchOptions {
 export function relaunch(target: InstallTarget, opts: RelaunchOptions = {}): Promise<void> {
   const platform = opts.platform ?? process.platform
   const args = [`${WAIT_FOR_FLAG}${opts.pid ?? process.pid}`, ...(opts.args ?? [])]
-  const direct = () => start(target.executable, args, opts.log)
-  if (platform !== 'darwin' || target.layout !== 'bundle') return direct().then(() => {})
+  const direct = () => start(target.executable, args, opts.log, opts.env)
+  if (platform !== 'darwin' || target.layout !== 'bundle' || opts.env) return direct().then(() => {})
   return new Promise<void>((resolve) => {
     // `error` and `exit` can both fire for one failure; the copy is started once.
     let settled = false
@@ -100,9 +111,9 @@ export function relaunch(target: InstallTarget, opts: RelaunchOptions = {}): Pro
  * Start `file` detached and resolve once it has started (true) or could not be (false, logged).
  * Not windowsHide: Windows applies SW_HIDE to a new process's first ShowWindow, which would be
  * the new app's main window (or the installer's progress window). Detached, it gets no console
- * window to hide anyway.
+ * window to hide anyway. Without `env` it inherits this process's.
  */
-function start(file: string, args: string[], log?: (line: string) => void): Promise<boolean> {
+function start(file: string, args: string[], log?: (line: string) => void, env?: NodeJS.ProcessEnv): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     let settled = false
     const settle = (ok: boolean) => {
@@ -111,7 +122,7 @@ function start(file: string, args: string[], log?: (line: string) => void): Prom
       clearTimeout(timer)
       resolve(ok)
     }
-    const child = spawn(file, args, { detached: true, stdio: 'ignore', windowsHide: false })
+    const child = spawn(file, args, { detached: true, stdio: 'ignore', windowsHide: false, env })
     child.on('spawn', () => settle(true))
     child.on('error', (err) => {
       log?.(`could not start ${file}: ${err.message}`)
@@ -171,6 +182,10 @@ export interface FinishOptions {
   installer?: InstallerHandoff
   /** Where install() staged its download, when the updater was given a `downloadDir`. */
   downloadDir?: string
+  /** Further arguments for the new copy, when this process starts it (not the Windows installer). */
+  args?: string[]
+  /** The new copy's environment; see `RelaunchOptions.env`. */
+  env?: NodeJS.ProcessEnv
   platform?: NodeJS.Platform
   log?: (line: string) => void
 }
@@ -192,7 +207,7 @@ export async function finishUpdate(opts: FinishOptions): Promise<void> {
     log?.(`starting the ${pending.version} installer`)
     if (await start(pending.file, args, log)) return
   }
-  if (opts.relaunch) await relaunch(target, { platform: opts.platform, log })
+  if (opts.relaunch) await relaunch(target, { platform: opts.platform, log, args: opts.args, env: opts.env })
 }
 
 export interface CleanUpOptions {
@@ -204,8 +219,13 @@ export interface CleanUpOptions {
 /**
  * Remove what an update left behind: a bundle copy staged beside the app and never swapped in,
  * the previous bundle a swap could not delete while it ran, and the downloads of processes that
- * have since exited (a Windows installer ran from one moments ago). Called at every launch;
- * swallows "still in use", which the next launch will see again.
+ * have since exited (a Windows installer ran from one moments ago). Swallows "still in use",
+ * which the next launch will see again.
+ *
+ * AT LAUNCH ONLY, before this process has installed anything — which is what makes a download
+ * folder named for THIS process's pid safe to remove: this process staged nothing yet, so the
+ * folder is an earlier process's that the OS gave the same pid, and `finishUpdate` would
+ * otherwise run the installer in it at quit (an old version over a newer one installed since).
  *
  * Never what ANOTHER running copy of the app is in the middle of: a staging folder whose `.pid`
  * names a live process, or a download folder of one.
@@ -227,7 +247,7 @@ export function cleanUpAfterUpdate(target: InstallTarget | null, opts: CleanUpOp
     }
     for (const name of names) {
       const pid = Number(name.slice(prefix.length))
-      if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && !isAlive(pid)) leftovers.push(path.join(dir, name))
+      if (Number.isInteger(pid) && pid > 0 && (pid === process.pid || !isAlive(pid))) leftovers.push(path.join(dir, name))
     }
   }
   for (const p of leftovers) {

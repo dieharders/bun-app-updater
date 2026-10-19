@@ -151,6 +151,10 @@ submodule is what keeps every app on one source.
    cleanUpAfterUpdate(installTarget(), { appName: "MyApp" }); // what an earlier update left behind
    ```
 
+   At launch and nowhere else: it also removes a download folder named for this process's own
+   pid, which at launch can only be an earlier process's that had the same pid. (The updater's
+   `cleanUp()` does nothing once an install has started.)
+
    and after the window closes — whether the page asked for a restart or the user just closed it:
 
    ```ts
@@ -167,7 +171,15 @@ submodule is what keeps every app on one source.
    or on a restart starts the new copy. Await it: on macOS the relaunch goes through `open -n`,
    and if that fails it starts the executable directly, which only a process still alive to see
    `open` fail can do. If the Windows installer cannot be started, the app is started again as
-   it is, so a Restart never ends with no app.
+   it is, so a Restart never ends with no app. `args` are passed to the new copy; `env` starts
+   it directly with that environment, in this working directory, instead of through `open` —
+   for a copy started from a terminal, which `open` would restart with launchd's variables and
+   `/` as its folder.
+
+   Every way the app ends has to reach `finishUpdate`, not only a closed window: a run with no
+   window (headless, or a webview that would not open) ends on a signal or on a restart the page
+   asks the server for, and a staged installer that is never started leaves the app refusing
+   work until the next launch throws the download away.
 
    With webview-bun, ending the loop from a bound callback is `lib.symbols.webview_terminate(webview.unsafeHandle)`
    (`import { lib } from 'webview-bun/src/ffi'`); the class's `destroy()` would free the handle
@@ -176,7 +188,11 @@ submodule is what keeps every app on one source.
 5. In the page: poll `GET /api/update` (on load and every half hour — the server asks the feed at
    most once per 30 minutes whatever the page does, and a failed check again after a minute),
    show `latest`, `installed` and `blocked`, stream `POST /api/update/install` and read
-   `downloading` / `unpacking` for a progress bar, and on `done.ok` call the restart binding.
+   `downloading` / `unpacking` for a progress bar (a `total` of 0 is a step of unknown length:
+   draw it indeterminate), and on `done.ok` call the restart binding. `checkFailed` says the
+   answer was no answer: ask again sooner than half an hour (backing off, so a rate-limited feed
+   is not asked every minute), and with `?force=1` when the browser reports the network back —
+   unforced, a check inside that minute returns the cached failure.
 
 6. To rehearse an update with nothing published, `writeLocalFeed({ dir, version, url })` writes
    a `release.json` beside the build's downloads that `jsonRelease` reads; launch the copy to
@@ -192,8 +208,12 @@ The app's installer has to do three things an ordinary install doesn't, and the 
   `WaitForSingleObject` from kernel32) so nothing is copied over the running executable.
 - **Start the app again when asked.** A `[Run]` entry with `Check:` on `/RELAUNCH=1`; the
   ordinary `postinstall skipifsilent` entry does nothing in a silent install.
-- **Remove what the new version no longer ships.** `[Files]` only adds and overwrites, so the
-  folders the build owns are emptied first with `[InstallDelete]`.
+- **Remove what the new version no longer ships, without risking the old one.** `[Files]` only
+  adds and overwrites, so what the build owns has to go first — but `[InstallDelete]` is not
+  undone when the install fails, and an update that dies half way (a shutdown, a full disk, a
+  locked file) would leave an app missing its own files. Move them aside instead
+  (`CurStepChanged(ssInstall)`), delete the moved copy once the install has finished
+  (`ssPostInstall`), and move it back in `DeinitializeSetup` when it has not.
 
 `/SILENT` shows the progress window and any error, which is what a user who pressed Restart
 should see; `/VERYSILENT /SUPPRESSMSGBOXES` would turn a failed install into an app that never
