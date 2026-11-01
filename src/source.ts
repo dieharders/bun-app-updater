@@ -184,7 +184,7 @@ export function staticRelease(release: Release | null): ReleaseSource {
   return { latest: async () => release }
 }
 
-function asRelease(raw: unknown): Release {
+export function asRelease(raw: unknown): Release {
   const r = raw as Partial<Release> | null
   if (!r || typeof r !== 'object' || typeof r.version !== 'string' || !parseVersion(r.version) || !Array.isArray(r.assets)) {
     throw new ReleaseFeedError('The release feed is not in the expected shape.', 'bad_feed')

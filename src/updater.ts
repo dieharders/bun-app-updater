@@ -2,7 +2,8 @@
  * The updater an app talks to: one object made from one config.
  *
  *   check()    what the feed offers, from this build's point of view, with a cache so however
- *              often a page asks, the feed is asked at most once per TTL.
+ *              often a page asks, the feed is asked at most once per TTL. With `checkFile` the
+ *              cache outlasts the process, so restarting the app does not ask again either.
  *   install()  download this platform's release, verify it, and put it in place — or, where an
  *              installer does the installing, stage it to run as the app quits.
  *   relaunch() finish as the app quits: run the staged installer, or start the new copy.
@@ -26,7 +27,7 @@ import path from 'node:path'
 import { downloadTo } from './download'
 import { type InstallErrorCode, UpdateError } from './errors'
 import { type InstallerHandoff, cleanUpAfterUpdate, finishUpdate, stageDir, writePendingInstaller } from './relaunch'
-import { ReleaseFeedError, type Release, type ReleaseAsset, type ReleaseSource } from './source'
+import { ReleaseFeedError, asRelease, type Release, type ReleaseAsset, type ReleaseSource } from './source'
 import { applyBundleUpdate } from './swap-bundle'
 import { type InstallTarget, blockedReason, installTarget, targetName } from './target'
 import { compareVersions } from './version'
@@ -59,6 +60,24 @@ export interface UpdaterConfig {
   blocked?: () => string | null
   /** How long a check's answer is reused. Default 30 minutes. */
   checkTtlMs?: number
+  /**
+   * Where the feed's last answer is kept, with when it came, so the TTL outlasts the process: an
+   * app restarted again and again asks the feed no more often than one left running, and still
+   * offers the update it found. Without it, a launch starts with no answer.
+   */
+  checkFile?: string
+  /**
+   * How long after launch a background check leaves the feed alone, answering from `checkFile`
+   * and saying so (`checkPending`). An app that quits inside this never reaches the feed. A forced
+   * check is someone asking, and does not wait. Default 0.
+   */
+  firstCheckDelayMs?: number
+  /**
+   * Ask the feed at most once per launch unless forced, however long the app runs and however
+   * often a page asks: a failed ask is not repeated, and a running copy finds a newer release at
+   * its next launch or when someone asks. For an app on a feed with a request budget.
+   */
+  oncePerLaunch?: boolean
   /** Where the download is staged. Default: the OS temp directory. */
   downloadDir?: string
   /** Where the updater's diagnostics go. Without it, only failures are written, with `console.warn`. */
@@ -79,11 +98,17 @@ export interface UpdateInfo {
   /** Why an in-place install is impossible here, so the UI offers the download page; null when it can. */
   blocked: string | null
   /**
-   * The last ask of the feed failed (offline, the feed down, rate-limited): `latest` is null for
-   * want of an answer, not because there is no update. A page asks again sooner than it would
-   * after an answer — the cached failure is asked again after a minute.
+   * The last ask of the feed failed (offline, the feed down, rate-limited): `latest` is the last
+   * answer's, or null for want of one, not because there is no update. A page asks again sooner
+   * than it would after an answer — the cached failure is asked again after a minute — unless
+   * `oncePerLaunch` says not to.
    */
   checkFailed: boolean
+  /**
+   * The feed is due an ask that `firstCheckDelayMs` is holding back: `latest` comes from the saved
+   * answer, or is null for want of one. A page asks again once the delay is over.
+   */
+  checkPending: boolean
 }
 
 export type InstallEvent =
@@ -130,11 +155,24 @@ interface CheckEntry {
   failed: boolean
 }
 
+/**
+ * What `checkFile` holds: when the feed was last asked, the release it last named, and whether
+ * that ask failed. A failed ask moves the time and keeps the release, since it was still a request,
+ * and a launch that finds the feed refusing should not ask it again inside the TTL. One that never
+ * reached the feed (`offline`) was no request, and is not saved.
+ */
+interface SavedCheck {
+  at: number
+  release: Release | null
+  failed?: boolean
+}
+
 const DEFAULT_TTL = 30 * 60_000
 /**
  * Even a forced check waits this long after the previous one: the feed is shared with everything
  * else on this address. A FAILED check is asked again after it too, forced or not, so an app that
- * started offline finds the update soon after the connection comes back.
+ * started offline finds the update soon after the connection comes back; with `oncePerLaunch`,
+ * only when forced.
  */
 const RECHECK_FLOOR = 60_000
 
@@ -144,6 +182,7 @@ export function createUpdater(config: UpdaterConfig): Updater {
   const target = installTarget({ execPath: config.execPath, platform })
   const targetId = targetName(platform, arch)
   const ttl = config.checkTtlMs ?? DEFAULT_TTL
+  const startedAt = Date.now()
   const log = config.log ?? (() => {})
   // Failures are written somewhere even when the app gives no `log`: what the user is shown is
   // deliberately plain (no paths, no errnos), so this line is the only record of what happened.
@@ -162,8 +201,11 @@ export function createUpdater(config: UpdaterConfig): Updater {
 
   let installed: string | null = null
   let installing = false
-  let lastCheck: CheckEntry | null = null
-  let lastRelease: Release | null = null
+  const saved = readCheck(config.checkFile)
+  let lastCheck: CheckEntry | null = saved && { at: saved.at, release: Promise.resolve(saved.release), failed: !!saved.failed }
+  // Restored with the answer: the release page is opened from this, and the offer may be all this launch has.
+  let lastRelease: Release | null = saved?.release ?? null
+  let askedThisLaunch = false
   // What the last check said about installing in place. Working it out writes a probe file into
   // the install folder and stats its volume (blockedReason), and a page polls; on Windows every
   // probe is also a Defender scan. So it is worked out again only when the feed is asked again,
@@ -183,7 +225,7 @@ export function createUpdater(config: UpdaterConfig): Updater {
   /** The app's own reason, after the updater's: asked every time, it is not cached with them. */
   const appBlocked = (): string | null => config.blocked?.() ?? null
 
-  const describe = (release: Release | null, checkFailed = false): UpdateInfo => {
+  const describe = (release: Release | null, checkFailed = false, checkPending = false): UpdateInfo => {
     const asset = isNewer(release) ? assetFor(release) : null
     const latest = release && asset ? { version: release.version, url: release.url, size: asset.size } : null
     const needBytes = latest ? latest.size * spaceFactor : 0
@@ -195,13 +237,29 @@ export function createUpdater(config: UpdaterConfig): Updater {
       installed,
       blocked: blockedCache.reason ?? appBlocked(),
       checkFailed,
+      checkPending,
     }
   }
 
   const fetchRelease = async (signal?: AbortSignal): Promise<Release | null> => {
+    log('asking the release feed')
     const release = await config.source.latest(signal)
     lastRelease = release
     return release
+  }
+
+  /** Written whole, then moved into place: a quit part way leaves the last answer, not half of this one. */
+  const saveCheck = (check: SavedCheck): void => {
+    if (!config.checkFile) return
+    const temp = `${config.checkFile}.${process.pid}.tmp`
+    try {
+      fs.mkdirSync(path.dirname(config.checkFile), { recursive: true })
+      fs.writeFileSync(temp, JSON.stringify(check))
+      fs.renameSync(temp, config.checkFile)
+    } catch (err) {
+      warn(`could not save the check: ${errorText(err)}`)
+      removeQuietly(temp)
+    }
   }
 
   const check: Updater['check'] = async (opts = {}) => {
@@ -210,9 +268,13 @@ export function createUpdater(config: UpdaterConfig): Updater {
     // A forced check (the user clicked) may ask again sooner than the TTL, but not sooner than
     // the floor — unless the last answer was a failure, which is exactly what a click retries.
     // A failed answer is not kept for the TTL either: offline at launch must not mean no update
-    // for half an hour after the connection is back.
-    const stale = !lastCheck || age > ttl || (lastCheck.failed ? opts.force || age > RECHECK_FLOOR : opts.force && age > RECHECK_FLOOR)
-    if (stale) {
+    // for half an hour after the connection is back. With `oncePerLaunch` a background check keeps
+    // it for the TTL: a failure saved by the last launch must not cost this one an ask.
+    const stale = !lastCheck || age > ttl || (lastCheck.failed ? opts.force || (!config.oncePerLaunch && age > RECHECK_FLOOR) : opts.force && age > RECHECK_FLOOR)
+    const held = !!stale && !opts.force && Date.now() - startedAt < (config.firstCheckDelayMs ?? 0)
+    const spent = !opts.force && !!config.oncePerLaunch && askedThisLaunch
+    if (stale && !held && !spent) {
+      askedThisLaunch = true
       // Offline, or the feed is down: no update to offer, and nothing worth telling the user
       // from a background check. A forced check surfaces the reason.
       //
@@ -223,11 +285,17 @@ export function createUpdater(config: UpdaterConfig): Updater {
         at: Date.now(),
         // One handler, so `failed` is set before anyone awaiting the answer reads it.
         release: release.then(
-          (found) => found,
+          (found) => {
+            saveCheck({ at: entry.at, release: found })
+            return found
+          },
           (err) => {
             entry.failed = true
             warn(`check failed: ${errorText(err)}`)
-            return null
+            const unreached = err instanceof ReleaseFeedError && err.code === 'offline'
+            if (!unreached) saveCheck({ at: entry.at, release: lastRelease, failed: true })
+            // What was known stands: with one ask a launch, null would hide an update until the next.
+            return lastRelease
           },
         ),
         failed: false,
@@ -245,9 +313,10 @@ export function createUpdater(config: UpdaterConfig): Updater {
         }
       }
     }
-    const entry = lastCheck!
+    const entry = lastCheck
+    if (!entry) return describe(null, false, held)
     const release = await untilAborted(entry.release, opts.signal)
-    return describe(release, entry.failed)
+    return describe(release, entry.failed, held)
   }
 
   const install: Updater['install'] = async ({ onEvent, signal }) => {
@@ -272,6 +341,7 @@ export function createUpdater(config: UpdaterConfig): Updater {
       try {
         release = await fetchRelease(signal)
         lastCheck = { at: Date.now(), release: Promise.resolve(release), failed: false }
+        saveCheck({ at: lastCheck.at, release })
       } catch (err) {
         // Only this install's own signal is a cancel. A feed's timeout is the network.
         if (signal?.aborted) fail('cancelled', 'The update was cancelled.', err)
@@ -372,6 +442,19 @@ const UNREACHABLE = 'The release feed could not be reached. Check your connectio
 const osName = (platform: NodeJS.Platform): string => (platform === 'win32' ? 'Windows' : platform === 'linux' ? 'Linux' : platform === 'darwin' ? 'macOS' : platform)
 
 const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err))
+
+/** The saved check, or null when there is none to trust: the feed is then asked as on a first launch. */
+function readCheck(file: string | undefined): SavedCheck | null {
+  if (!file) return null
+  try {
+    const { at, release, failed } = JSON.parse(fs.readFileSync(file, 'utf8')) as { at?: unknown; release?: unknown; failed?: unknown }
+    // A time ahead of the clock (a clock since corrected) would hold the next ask off for as long.
+    if (typeof at !== 'number' || at > Date.now()) return null
+    return { at, release: release === null ? null : asRelease(release), failed: failed === true }
+  } catch {
+    return null
+  }
+}
 
 /**
  * `promise`, or a `cancelled` rejection as soon as `signal` fires, whichever comes first. The
