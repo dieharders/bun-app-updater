@@ -156,20 +156,23 @@ interface CheckEntry {
 }
 
 /**
- * What `checkFile` holds: when the feed was last asked, and the release it last named. A failed
- * ask moves the time and keeps the release, since it was still a request, and a launch that finds
- * the feed refusing should not ask it again inside the TTL.
+ * What `checkFile` holds: when the feed was last asked, the release it last named, and whether
+ * that ask failed. A failed ask moves the time and keeps the release, since it was still a request,
+ * and a launch that finds the feed refusing should not ask it again inside the TTL. One that never
+ * reached the feed (`offline`) was no request, and is not saved.
  */
 interface SavedCheck {
   at: number
   release: Release | null
+  failed?: boolean
 }
 
 const DEFAULT_TTL = 30 * 60_000
 /**
  * Even a forced check waits this long after the previous one: the feed is shared with everything
  * else on this address. A FAILED check is asked again after it too, forced or not, so an app that
- * started offline finds the update soon after the connection comes back.
+ * started offline finds the update soon after the connection comes back; with `oncePerLaunch`,
+ * only when forced.
  */
 const RECHECK_FLOOR = 60_000
 
@@ -199,7 +202,7 @@ export function createUpdater(config: UpdaterConfig): Updater {
   let installed: string | null = null
   let installing = false
   const saved = readCheck(config.checkFile)
-  let lastCheck: CheckEntry | null = saved && { at: saved.at, release: Promise.resolve(saved.release), failed: false }
+  let lastCheck: CheckEntry | null = saved && { at: saved.at, release: Promise.resolve(saved.release), failed: !!saved.failed }
   // Restored with the answer: the release page is opened from this, and the offer may be all this launch has.
   let lastRelease: Release | null = saved?.release ?? null
   let askedThisLaunch = false
@@ -265,8 +268,9 @@ export function createUpdater(config: UpdaterConfig): Updater {
     // A forced check (the user clicked) may ask again sooner than the TTL, but not sooner than
     // the floor — unless the last answer was a failure, which is exactly what a click retries.
     // A failed answer is not kept for the TTL either: offline at launch must not mean no update
-    // for half an hour after the connection is back.
-    const stale = !lastCheck || age > ttl || (lastCheck.failed ? opts.force || age > RECHECK_FLOOR : opts.force && age > RECHECK_FLOOR)
+    // for half an hour after the connection is back. With `oncePerLaunch` a background check keeps
+    // it for the TTL: a failure saved by the last launch must not cost this one an ask.
+    const stale = !lastCheck || age > ttl || (lastCheck.failed ? opts.force || (!config.oncePerLaunch && age > RECHECK_FLOOR) : opts.force && age > RECHECK_FLOOR)
     const held = !!stale && !opts.force && Date.now() - startedAt < (config.firstCheckDelayMs ?? 0)
     const spent = !opts.force && !!config.oncePerLaunch && askedThisLaunch
     if (stale && !held && !spent) {
@@ -288,7 +292,8 @@ export function createUpdater(config: UpdaterConfig): Updater {
           (err) => {
             entry.failed = true
             warn(`check failed: ${errorText(err)}`)
-            saveCheck({ at: entry.at, release: lastRelease })
+            const unreached = err instanceof ReleaseFeedError && err.code === 'offline'
+            if (!unreached) saveCheck({ at: entry.at, release: lastRelease, failed: true })
             // What was known stands: with one ask a launch, null would hide an update until the next.
             return lastRelease
           },
@@ -442,10 +447,10 @@ const errorText = (err: unknown): string => (err instanceof Error ? err.message 
 function readCheck(file: string | undefined): SavedCheck | null {
   if (!file) return null
   try {
-    const { at, release } = JSON.parse(fs.readFileSync(file, 'utf8')) as { at?: unknown; release?: unknown }
+    const { at, release, failed } = JSON.parse(fs.readFileSync(file, 'utf8')) as { at?: unknown; release?: unknown; failed?: unknown }
     // A time ahead of the clock (a clock since corrected) would hold the next ask off for as long.
     if (typeof at !== 'number' || at > Date.now()) return null
-    return { at, release: release === null ? null : asRelease(release) }
+    return { at, release: release === null ? null : asRelease(release), failed: failed === true }
   } catch {
     return null
   }

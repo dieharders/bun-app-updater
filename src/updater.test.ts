@@ -150,8 +150,35 @@ describe('the saved check', () => {
     const refused = await later(61_000, () => make({ source: failing, checkFile, checkTtlMs: 60_000 }).check())
     expect(refused).toMatchObject({ latest: { version: '1.1.0' }, checkFailed: true })
     const next = await later(62_000, () => make({ source: feed.source, checkFile, checkTtlMs: 60_000 }).check())
-    expect(next).toMatchObject({ latest: { version: '1.1.0' }, checkFailed: false })
+    expect(next).toMatchObject({ latest: { version: '1.1.0' }, checkFailed: true })
     expect(feed.calls).toBe(1) // inside the TTL of the failed ask
+  })
+  test('a saved failure is not an answer: a forced check asks at once, inside the floor', async () => {
+    const { feed, checkFile } = counted()
+    const failing: ReleaseSource = {
+      latest: async () => {
+        throw new ReleaseFeedError('rate limited', 'rate_limited')
+      },
+    }
+    await make({ source: failing, checkFile }).check()
+    const restarted = make({ source: feed.source, checkFile })
+    expect(await restarted.check({ force: true })).toMatchObject({ latest: { version: '1.1.0' }, checkFailed: false })
+    expect(feed.calls).toBe(1)
+  })
+  test('an ask that never reached the feed saves nothing: the next launch asks', async () => {
+    const { feed, checkFile } = counted()
+    const options = { checkFile, checkTtlMs: 60_000, oncePerLaunch: true }
+    await make({ ...options, source: feed.source }).check()
+    const saved = fs.readFileSync(checkFile, 'utf8')
+    const offline: ReleaseSource = {
+      latest: async () => {
+        throw new ReleaseFeedError('unreachable', 'offline')
+      },
+    }
+    await later(61_000, () => make({ ...options, source: offline }).check())
+    expect(fs.readFileSync(checkFile, 'utf8')).toBe(saved)
+    await later(62_000, () => make({ ...options, source: feed.source }).check())
+    expect(feed.calls).toBe(2)
   })
   test('a file that cannot be trusted counts as no check: unreadable, the wrong shape, or from the future', async () => {
     for (const body of ['{"at":', '{"at":"soon","release":null}', '{"at":1}', '{"at":1,"release":{"version":"x","assets":[]}}', JSON.stringify({ at: Date.now() + 3_600_000, release: null })]) {
@@ -236,6 +263,14 @@ describe('one ask a launch', () => {
     const u = make({ source, oncePerLaunch: true })
     await u.check()
     expect(await later(61_000, () => u.check())).toMatchObject({ checkFailed: true, checkPending: false })
+    expect(source.calls).toBe(1)
+  })
+  test('a failure saved by the last launch holds the next one off until the TTL is over', async () => {
+    const { checkFile } = counted()
+    const source = failing()
+    const options = { source, checkFile, firstCheckDelayMs: 60_000, oncePerLaunch: true }
+    await make(options).check({ force: true }).catch(() => {})
+    expect(await later(120_000, () => make(options).check())).toMatchObject({ checkFailed: true, checkPending: false })
     expect(source.calls).toBe(1)
   })
   test('a launch with a fresh answer has its ask left, if anything still asks once that answer goes stale', async () => {

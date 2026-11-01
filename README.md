@@ -212,7 +212,8 @@ submodule is what keeps every app on one source.
    To spend as little of the feed's request budget as possible, give `createUpdater` a
    `checkFile`, a `firstCheckDelayMs` and `oncePerLaunch: true`, and do not poll. `checkFile` keeps
    the feed's last answer on disk, so a launch inside the TTL does not ask the feed and still
-   offers the update it found; a failed ask counts too. `firstCheckDelayMs` keeps background
+   offers the update it found; a failed ask counts too, unless it never reached the feed
+   (`offline`). `firstCheckDelayMs` keeps background
    checks off the feed for that long after launch, so a copy that quits straight away never
    reaches it. `oncePerLaunch` stops there being a second: a failed ask is not repeated, and a
    copy left running finds a newer release at its next launch. `?force=1` is someone asking, and
