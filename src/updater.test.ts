@@ -100,10 +100,170 @@ const makeWindows = (over: Partial<UpdaterConfig> = {}) => {
   })
 }
 
+/** A feed that counts its asks, and a `checkFile` of its own. */
+const counted = (answer: () => Release | null = () => release('1.1.0')) => {
+  const feed: { calls: number; source: ReleaseSource } = { calls: 0, source: { latest: async () => (feed.calls++, answer()) } }
+  return { feed, checkFile: path.join(fs.mkdtempSync(path.join(tmp, 'check-')), 'nested', 'update-check.json') }
+}
+
+/** Run `fn` with the clock `ms` ahead. */
+const later = async <T>(ms: number, fn: () => Promise<T>): Promise<T> => {
+  const now = Date.now
+  Date.now = () => now() + ms
+  try {
+    return await fn()
+  } finally {
+    Date.now = now
+  }
+}
+
+describe('the saved check', () => {
+  test('a restart inside the TTL does not ask the feed, and still offers what it found', async () => {
+    const { feed, checkFile } = counted()
+    await make({ source: feed.source, checkFile }).check()
+    expect(feed.calls).toBe(1)
+    const restarted = make({ source: feed.source, checkFile })
+    expect(await restarted.check()).toMatchObject({ latest: { version: '1.1.0' }, checkFailed: false, checkPending: false })
+    expect(feed.calls).toBe(1)
+    expect(restarted.lastRelease()?.version).toBe('1.1.0') // what the release page is opened from
+  })
+  test('a restart past the TTL asks the feed', async () => {
+    const { feed, checkFile } = counted()
+    await make({ source: feed.source, checkFile, checkTtlMs: 60_000 }).check()
+    await later(61_000, () => make({ source: feed.source, checkFile, checkTtlMs: 60_000 }).check())
+    expect(feed.calls).toBe(2)
+  })
+  test('"nothing published" is an answer too: it holds the feed off just the same', async () => {
+    const { feed, checkFile } = counted(() => null)
+    await make({ source: feed.source, checkFile }).check()
+    await make({ source: feed.source, checkFile }).check()
+    expect(feed.calls).toBe(1)
+  })
+  test('a failed ask counts as the check, and what was known stands: that launch and the next still offer it', async () => {
+    const { feed, checkFile } = counted()
+    await make({ source: feed.source, checkFile, checkTtlMs: 60_000 }).check()
+    const failing: ReleaseSource = {
+      latest: async () => {
+        throw new ReleaseFeedError('rate limited', 'rate_limited')
+      },
+    }
+    const refused = await later(61_000, () => make({ source: failing, checkFile, checkTtlMs: 60_000 }).check())
+    expect(refused).toMatchObject({ latest: { version: '1.1.0' }, checkFailed: true })
+    const next = await later(62_000, () => make({ source: feed.source, checkFile, checkTtlMs: 60_000 }).check())
+    expect(next).toMatchObject({ latest: { version: '1.1.0' }, checkFailed: false })
+    expect(feed.calls).toBe(1) // inside the TTL of the failed ask
+  })
+  test('a file that cannot be trusted counts as no check: unreadable, the wrong shape, or from the future', async () => {
+    for (const body of ['{"at":', '{"at":"soon","release":null}', '{"at":1}', '{"at":1,"release":{"version":"x","assets":[]}}', JSON.stringify({ at: Date.now() + 3_600_000, release: null })]) {
+      const { feed, checkFile } = counted()
+      fs.mkdirSync(path.dirname(checkFile), { recursive: true })
+      fs.writeFileSync(checkFile, body)
+      await make({ source: feed.source, checkFile }).check()
+      expect(feed.calls).toBe(1)
+    }
+  })
+  test('a file that cannot be written only costs the next launch an ask', async () => {
+    const { feed, checkFile } = counted()
+    fs.mkdirSync(checkFile, { recursive: true }) // a folder where the file goes
+    const logged: string[] = []
+    const info = await make({ source: feed.source, checkFile, log: (line) => logged.push(line) }).check()
+    expect(info.latest?.version).toBe('1.1.0')
+    expect(logged.some((line) => line.startsWith('could not save the check'))).toBe(true)
+    expect(fs.readdirSync(path.dirname(checkFile))).toEqual([path.basename(checkFile)])
+  })
+})
+
+describe('the first check after launch', () => {
+  test('a background check leaves the feed alone until the delay is over, and says so', async () => {
+    const { feed } = counted()
+    const u = make({ source: feed.source, firstCheckDelayMs: 60_000 })
+    expect(await u.check()).toMatchObject({ latest: null, checkPending: true, checkFailed: false })
+    expect(feed.calls).toBe(0)
+    expect(await later(59_000, () => u.check())).toMatchObject({ checkPending: true })
+    expect(feed.calls).toBe(0)
+    expect(await later(61_000, () => u.check())).toMatchObject({ latest: { version: '1.1.0' }, checkPending: false })
+    expect(feed.calls).toBe(1)
+  })
+  test('a stale saved answer is shown meanwhile, and the ask stays due', async () => {
+    const { feed, checkFile } = counted()
+    const options = { source: feed.source, checkFile, checkTtlMs: 60_000, firstCheckDelayMs: 60_000 }
+    await later(-120_000, () => make(options).check({ force: true }))
+    expect(feed.calls).toBe(1)
+    const u = make(options)
+    expect(await u.check()).toMatchObject({ latest: { version: '1.1.0' }, checkPending: true })
+    expect(feed.calls).toBe(1)
+    await later(61_000, () => u.check())
+    expect(feed.calls).toBe(2)
+  })
+  test('nothing is pending when the saved answer is fresh: the delay has nothing to hold back', async () => {
+    const { feed, checkFile } = counted()
+    await make({ source: feed.source, checkFile }).check()
+    const u = make({ source: feed.source, checkFile, firstCheckDelayMs: 60_000 })
+    expect(await u.check()).toMatchObject({ latest: { version: '1.1.0' }, checkPending: false })
+    expect(feed.calls).toBe(1)
+  })
+  test('a forced check is someone asking: it does not wait, and its answer is saved', async () => {
+    const { feed, checkFile } = counted()
+    const u = make({ source: feed.source, checkFile, firstCheckDelayMs: 60_000 })
+    expect(await u.check({ force: true })).toMatchObject({ latest: { version: '1.1.0' }, checkPending: false })
+    expect(feed.calls).toBe(1)
+    expect(JSON.parse(fs.readFileSync(checkFile, 'utf8')).release.version).toBe('1.1.0')
+  })
+})
+
+describe('one ask a launch', () => {
+  const failing = (): ReleaseSource & { calls: number } => {
+    const feed = {
+      calls: 0,
+      latest: async () => {
+        feed.calls++
+        throw new ReleaseFeedError('rate limited', 'rate_limited')
+      },
+    }
+    return feed
+  }
+
+  test('past the TTL, a running copy does not ask again however often a page asks', async () => {
+    const { feed } = counted()
+    const u = make({ source: feed.source, checkTtlMs: 60_000, oncePerLaunch: true })
+    await u.check()
+    expect(await later(3_600_000, () => u.check())).toMatchObject({ latest: { version: '1.1.0' }, checkPending: false })
+    await later(7_200_000, () => u.check())
+    expect(feed.calls).toBe(1)
+  })
+  test('a failed ask is not repeated, and the answer goes on saying it failed', async () => {
+    const source = failing()
+    const u = make({ source, oncePerLaunch: true })
+    await u.check()
+    expect(await later(61_000, () => u.check())).toMatchObject({ checkFailed: true, checkPending: false })
+    expect(source.calls).toBe(1)
+  })
+  test('a launch with a fresh answer has its ask left, if anything still asks once that answer goes stale', async () => {
+    const { feed, checkFile } = counted()
+    const options = { source: feed.source, checkFile, checkTtlMs: 60_000, oncePerLaunch: true }
+    await make(options).check()
+    const u = make(options)
+    await u.check()
+    expect(feed.calls).toBe(1)
+    await later(61_000, () => u.check())
+    await later(122_000, () => u.check())
+    expect(feed.calls).toBe(2)
+  })
+  test('someone asking is not limited, and it uses up the launch\'s ask', async () => {
+    const { feed } = counted()
+    const u = make({ source: feed.source, checkTtlMs: 60_000, oncePerLaunch: true })
+    await u.check({ force: true })
+    await later(61_000, () => u.check({ force: true }))
+    expect(feed.calls).toBe(2)
+    await later(200_000, () => u.check())
+    expect(feed.calls).toBe(2)
+  })
+})
+
 describe('check', () => {
   test('a newer release with a download for this target is offered, with that download\'s size', async () => {
     const info = await make().check()
-    expect(info).toEqual({ current: '1.0.0', target: 'darwin-arm64', latest: { version: '1.1.0', url: 'https://x/1.1.0', size: served.get('App-darwin-arm64.dmg')!.length }, installed: null, blocked: null, checkFailed: false })
+    expect(info).toEqual({ current: '1.0.0', target: 'darwin-arm64', latest: { version: '1.1.0', url: 'https://x/1.1.0', size: served.get('App-darwin-arm64.dmg')!.length }, installed: null, blocked: null, checkFailed: false, checkPending: false })
   })
   test('not newer, not this target, nothing published', async () => {
     expect((await make({ source: staticRelease(release('1.0.0')) }).check()).latest).toBeNull()

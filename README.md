@@ -200,13 +200,25 @@ submodule is what keeps every app on one source.
    that `run()` frees again on return.
 
 5. In the page: poll `GET /api/update` (on load and every half hour — the server asks the feed at
-   most once per 30 minutes whatever the page does, and a failed check again after a minute),
-   show `latest`, `installed` and `blocked`, stream `POST /api/update/install` and read
-   `downloading` / `unpacking` for a progress bar (a `total` of 0 is a step of unknown length:
-   draw it indeterminate), and on `done.ok` call the restart binding. `checkFailed` says the
-   answer was no answer: ask again sooner than half an hour (backing off, so a rate-limited feed
-   is not asked every minute), and with `?force=1` when the browser reports the network back —
-   unforced, a check inside that minute returns the cached failure.
+   most once per `checkTtlMs`, default 30 minutes, whatever the page does, and a failed check
+   again after a minute), show `latest`, `installed` and `blocked`, stream
+   `POST /api/update/install` and read `downloading` / `unpacking` for a progress bar (a `total`
+   of 0 is a step of unknown length: draw it indeterminate), and on `done.ok` call the restart
+   binding. `checkFailed` says the answer was no answer: ask again sooner than half an hour
+   (backing off, so a rate-limited feed is not asked every minute), and with `?force=1` when the
+   browser reports the network back — unforced, a check inside that minute returns the cached
+   failure.
+
+   To spend as little of the feed's request budget as possible, give `createUpdater` a
+   `checkFile`, a `firstCheckDelayMs` and `oncePerLaunch: true`, and do not poll. `checkFile` keeps
+   the feed's last answer on disk, so a launch inside the TTL does not ask the feed and still
+   offers the update it found; a failed ask counts too. `firstCheckDelayMs` keeps background
+   checks off the feed for that long after launch, so a copy that quits straight away never
+   reaches it. `oncePerLaunch` stops there being a second: a failed ask is not repeated, and a
+   copy left running finds a newer release at its next launch. `?force=1` is someone asking, and
+   none of this holds it back. Ask on load, and once more after the delay if the answer says
+   `checkPending`. Leave `checkFile` out for a local feed: a saved answer from the real feed would
+   stand in for it, and the other way round.
 
 6. To rehearse an update with nothing published, `writeLocalFeed({ dir, version, url })` writes
    a `release.json` beside the build's downloads that `jsonRelease` reads; launch the copy to
